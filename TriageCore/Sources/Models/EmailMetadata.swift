@@ -26,6 +26,9 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
     public var category: EmailCategory?
     public var safetyTier: SafetyTier?
     public var categoryConfidence: Double?
+    /// Human-readable justification from the engine, e.g. "Mixed sender (amazon.com)
+    /// with a transactional subject". Shown in the UI so a user can judge a decision.
+    public var categoryReason: String?
 
     // Action tracking
     public var actionTaken: EmailAction?
@@ -52,6 +55,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         category: EmailCategory? = nil,
         safetyTier: SafetyTier? = nil,
         categoryConfidence: Double? = nil,
+        categoryReason: String? = nil,
         actionTaken: EmailAction? = nil,
         actionDate: Date? = nil,
         createdAt: Date = Date(),
@@ -74,6 +78,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         self.category = category
         self.safetyTier = safetyTier
         self.categoryConfidence = categoryConfidence
+        self.categoryReason = categoryReason
         self.actionTaken = actionTaken
         self.actionDate = actionDate
         self.createdAt = createdAt
@@ -86,7 +91,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         case subject, date, snippet
         case hasListUnsubscribe, listUnsubscribeHeader, replyTo
         case labels, isUnread
-        case category, safetyTier, categoryConfidence
+        case category, safetyTier, categoryConfidence, categoryReason
         case actionTaken, actionDate
         case createdAt, updatedAt
     }
@@ -99,7 +104,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
 // MARK: - Enums
 
 /// Email categories assigned by the rule engine or AI
-public enum EmailCategory: String, Codable, CaseIterable {
+public enum EmailCategory: String, Codable, CaseIterable, Sendable {
     case newsletter
     case promotion
     case notification
@@ -126,7 +131,7 @@ public enum EmailCategory: String, Codable, CaseIterable {
 }
 
 /// Safety tier determines how an email can be acted upon
-public enum SafetyTier: String, Codable, CaseIterable {
+public enum SafetyTier: String, Codable, CaseIterable, Sendable {
     case safe       // Auto-actionable (old promos, newsletters)
     case review     // Needs user approval before action
     case protected_ // Never auto-deleted (contacts, replies, important)
@@ -142,7 +147,7 @@ public enum SafetyTier: String, Codable, CaseIterable {
 }
 
 /// Actions that can be taken on emails
-public enum EmailAction: String, Codable, CaseIterable {
+public enum EmailAction: String, Codable, CaseIterable, Sendable {
     case archived
     case deleted
     case labeled

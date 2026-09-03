@@ -10,14 +10,22 @@ final class AppState: ObservableObject {
     @Published var accountStats: AccountStats?
     @Published var actionPlan: ActionPlan?
     @Published var isExecuting = false
+    /// Number of addresses currently protected. Surfaced so a user can see at a glance
+    /// whether contact detection has actually run — a zero here means every "Protected"
+    /// count in the UI is zero too.
+    @Published var knownContactCount = 0
+    @Published var isRefreshingContacts = false
 
     private let database: AppDatabase
+    private let contactDetector: ContactDetector
     private var gmailService: GmailService?
     private var batchExecutor: BatchExecutor?
 
     init() {
         do {
-            self.database = try AppDatabase.shared()
+            let db = try AppDatabase.shared()
+            self.database = db
+            self.contactDetector = ContactDetector(database: db)
         } catch {
             fatalError("Failed to initialize database: \(error)")
         }
@@ -68,10 +76,46 @@ final class AppState: ObservableObject {
 
             scanProgress?.status = .completed
 
+            // Build the contact list BEFORE categorizing. Without this the engine's
+            // highest-priority rule (known contact -> personal/protected) cannot fire,
+            // so nothing is ever protected from the action plan.
+            await refreshContacts(for: account, using: service)
+
             // Auto-categorize after scan
             await categorizeEmails(accountId: accountId)
         } catch {
             scanProgress?.status = .failed(error.localizedDescription)
+        }
+    }
+
+    /// Detect and persist the account's real correspondents.
+    ///
+    /// Failure here is non-fatal but IS surfaced: falling back to an empty contact set
+    /// silently disables the protected tier, which is exactly the kind of degradation
+    /// that should never be quiet.
+    func refreshContacts(for account: EmailAccount, using service: GmailService) async {
+        guard let accountId = account.id else { return }
+        isRefreshingContacts = true
+        defer { isRefreshingContacts = false }
+
+        do {
+            let sentContacts = try await service.fetchSentMailContacts(
+                accountId: accountId,
+                ownAddress: account.email
+            )
+            let contacts = try await contactDetector.refreshAndPersist(
+                accountId: accountId,
+                sentMailContacts: sentContacts
+            )
+            knownContactCount = contacts.count
+        } catch {
+            // Fall back to whatever was persisted previously rather than an empty set.
+            let fallback = (try? await contactDetector.loadPersistedContacts(accountId: accountId)) ?? []
+            knownContactCount = fallback.count
+            scanProgress?.status = .failed(
+                "Contact detection failed (\(error.localizedDescription)). "
+                + "Using \(fallback.count) previously-saved contacts — review the plan carefully."
+            )
         }
     }
 
@@ -83,7 +127,13 @@ final class AppState: ObservableObject {
                 return
             }
 
-            let engine = RuleBasedEngine()
+            // Load the persisted contact set. Constructing RuleBasedEngine() without
+            // this leaves knownContacts empty, which silently disables the only rule
+            // that assigns the protected tier.
+            let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
+            knownContactCount = contacts.count
+
+            let engine = RuleBasedEngine(knownContacts: contacts)
             let results = try await engine.categorize(emails: uncategorized)
             try await database.updateCategories(results, accountId: accountId)
 
@@ -92,6 +142,41 @@ final class AppState: ObservableObject {
         } catch {
             print("Categorization failed: \(error)")
         }
+    }
+
+    /// Re-run categorization over every email, discarding cached decisions.
+    /// Needed after the contact list changes, since previously-categorized mail
+    /// was judged against the older (possibly empty) contact set.
+    func recategorizeAll(accountId: Int64) async {
+        do {
+            let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
+            knownContactCount = contacts.count
+
+            let all = try await database.fetchEmails(accountId: accountId, limit: 50000, offset: 0)
+            guard !all.isEmpty else { return }
+
+            let engine = RuleBasedEngine(knownContacts: contacts)
+            let results = try await engine.categorize(emails: all)
+            try await database.updateCategories(results, accountId: accountId)
+            accountStats = try await database.accountStats(accountId: accountId)
+        } catch {
+            print("Recategorization failed: \(error)")
+        }
+    }
+
+    /// Pin an address so its mail is never auto-actioned, then re-apply categorization.
+    func pinContact(email: String, accountId: Int64) async {
+        do {
+            try await database.addManualContact(email: email, accountId: accountId)
+            await recategorizeAll(accountId: accountId)
+        } catch {
+            print("Failed to pin contact: \(error)")
+        }
+    }
+
+    func loadContactCount(accountId: Int64) async {
+        let contacts = (try? await contactDetector.loadPersistedContacts(accountId: accountId)) ?? []
+        knownContactCount = contacts.count
     }
 
     func generatePlan() async {
@@ -115,6 +200,11 @@ final class AppState: ObservableObject {
 
     func fetchEmailsByTier(accountId: Int64, tier: SafetyTier) async throws -> [EmailMetadata] {
         try await database.fetchEmailsByTier(accountId: accountId, tier: tier, limit: 500)
+    }
+
+    /// The review queue, least-confident first — the correct order for human review.
+    func fetchEmailsForReview(accountId: Int64) async throws -> [EmailMetadata] {
+        try await database.fetchEmailsForReview(accountId: accountId)
     }
 
     func findSimilarBySubject(accountId: Int64, subject: String) async throws -> [EmailMetadata] {

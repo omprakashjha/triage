@@ -187,17 +187,98 @@ final class RuleBasedEngineTests: XCTestCase {
     // MARK: - Edge Cases
 
     func testAmazonMultiCategory() async throws {
-        // Amazon sends both promotions and transactional emails
-        // From the same domain — our rule engine will classify based on domain
+        // Amazon sends both promotions and transactional mail from one domain, so the
+        // domain alone cannot decide. The subject breaks the tie.
         let promo = makeEmail(senderEmail: "store@amazon.com", subject: "Deal of the day")
         let receipt = makeEmail(senderEmail: "auto-confirm@amazon.com", subject: "Your order receipt")
 
         let results = try await engine.categorize(emails: [promo, receipt])
 
-        // Both hit the promotional domain rule since amazon.com is in promotional set
-        // This is a known limitation — AI engine would handle this better
         XCTAssertEqual(results[0].category, .promotion)
-        XCTAssertEqual(results[1].category, .promotion)
+        XCTAssertEqual(results[0].safetyTier, .safe)
+
+        // Previously this also came back as .promotion / .safe and was auto-deleted
+        // after 30 days by the default rules.
+        XCTAssertEqual(results[1].category, .transactional)
+        XCTAssertEqual(results[1].safetyTier, .review)
+    }
+
+    func testMixedSenderWithAmbiguousSubjectNeedsReview() async throws {
+        let email = makeEmail(senderEmail: "no-reply@apple.com", subject: "Your Apple ID was used to sign in")
+        let results = try await engine.categorize(emails: [email])
+
+        // Ambiguous subject from a mixed sender must never be auto-actionable.
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    // MARK: - Regression: generic transport subdomains must not auto-delete
+
+    func testBankOnGenericMailSubdomainIsNotAutoDeletable() async throws {
+        // `mail.` is a generic bulk-transport subdomain used by banks as much as retailers.
+        // This previously matched the promotional subdomain heuristic BEFORE the
+        // transactional check and became .promotion/.safe -> deleted after 30 days.
+        let email = makeEmail(senderEmail: "alerts@mail.chase.com", subject: "Your statement is ready")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .transactional)
+        XCTAssertEqual(results[0].safetyTier, .review)
+    }
+
+    func testUnknownSenderOnGenericMailSubdomainIsReviewNotSafe() async throws {
+        // An unlisted domain behind `mail.` is only weak evidence of marketing.
+        let email = makeEmail(senderEmail: "hello@mail.mylocalcreditunion.com", subject: "Notice about your account")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .review, "generic subdomain alone must not be auto-actionable")
+    }
+
+    func testDiscriminatingPromoSubdomainStaysSafe() async throws {
+        // `deals.` genuinely signals marketing, so auto-action is still appropriate.
+        let email = makeEmail(senderEmail: "x@deals.someshop.com", subject: "New arrivals")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .promotion)
+        XCTAssertEqual(results[0].safetyTier, .safe)
+    }
+
+    func testReceiptWithListUnsubscribeIsNotAutoDeletable() async throws {
+        // Transactional mail increasingly carries one-click unsubscribe headers.
+        let email = makeEmail(
+            senderEmail: "billing@someservice.io",
+            subject: "Your invoice for July",
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .transactional)
+        XCTAssertEqual(results[0].safetyTier, .review)
+    }
+
+    // MARK: - Regression: automated-sender false positives
+
+    func testInfoAddressIsNotAutoDeletable() async throws {
+        // `info@` is how a great many small businesses and clinics send real mail.
+        let email = makeEmail(senderEmail: "info@thelocalgarage.co.uk", subject: "About your booking on Tuesday")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe, "ambiguous local part must not be auto-actionable")
+    }
+
+    func testSurnameStartingWithAutomatedTokenIsNotAutomated() async throws {
+        // "newsome" starts with "news" but is a surname — prefix matching got this wrong.
+        let email = makeEmail(senderEmail: "jnewsome@somefirm.com", subject: "Following up on our call")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .unknown)
+        XCTAssertEqual(results[0].safetyTier, .review)
+    }
+
+    func testAutomatedTokenWithSeparatorStillMatches() async throws {
+        let email = makeEmail(senderEmail: "no-reply@someservice.com", subject: "Scheduled maintenance")
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .notification)
+        XCTAssertEqual(results[0].safetyTier, .safe)
     }
 
     // MARK: - Helpers

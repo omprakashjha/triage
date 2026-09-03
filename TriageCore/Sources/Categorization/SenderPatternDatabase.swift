@@ -1,5 +1,30 @@
 import Foundation
 
+/// How strong the evidence behind a domain match is.
+///
+/// This matters because the *tier* (auto-actionable vs needs-approval) should follow
+/// the quality of the evidence, not just the category. Matching `deals.brand.com`
+/// is strong evidence of marketing; matching `mail.anything.com` is not — `mail.` and
+/// `email.` are generic transport subdomains used by banks and utilities too.
+public enum DomainMatchStrength: Sendable, Equatable {
+    /// The domain (or its parent) is explicitly listed.
+    case explicit
+    /// A known bulk-marketing platform (Mailchimp, SendGrid, Klaviyo, ...).
+    case platform
+    /// Only a generic transport subdomain matched (`mail.`, `email.`). Weak.
+    case generic
+    /// No match.
+    case none
+
+    /// Whether this match is strong enough to justify an auto-actionable tier.
+    public var isStrong: Bool {
+        switch self {
+        case .explicit, .platform: return true
+        case .generic, .none: return false
+        }
+    }
+}
+
 /// Database of known sender patterns for rule-based email categorization.
 /// Contains promotional domains, notification senders, social platforms, and transactional services.
 public struct SenderPatternDatabase: Sendable {
@@ -21,6 +46,11 @@ public struct SenderPatternDatabase: Sendable {
     /// Marketing platform sending domains (Mailchimp, SendGrid, etc.)
     private let marketingPlatformDomains: Set<String>
 
+    /// Domains that legitimately send BOTH promotional and transactional mail
+    /// (Amazon sends "Deal of the day" and "Your order receipt" from the same domain).
+    /// A domain alone cannot classify these — the subject has to break the tie.
+    private let mixedDomains: Set<String>
+
     // MARK: - Default Instance
 
     public static let `default` = SenderPatternDatabase(
@@ -28,7 +58,8 @@ public struct SenderPatternDatabase: Sendable {
         notificationDomains: Self.defaultNotificationDomains,
         socialDomains: Self.defaultSocialDomains,
         transactionalDomains: Self.defaultTransactionalDomains,
-        marketingPlatformDomains: Self.defaultMarketingPlatformDomains
+        marketingPlatformDomains: Self.defaultMarketingPlatformDomains,
+        mixedDomains: Self.defaultMixedDomains
     )
 
     public init(
@@ -36,33 +67,69 @@ public struct SenderPatternDatabase: Sendable {
         notificationDomains: Set<String>,
         socialDomains: Set<String>,
         transactionalDomains: Set<String>,
-        marketingPlatformDomains: Set<String>
+        marketingPlatformDomains: Set<String>,
+        mixedDomains: Set<String> = []
     ) {
         self.promotionalDomains = promotionalDomains
         self.notificationDomains = notificationDomains
         self.socialDomains = socialDomains
         self.transactionalDomains = transactionalDomains
         self.marketingPlatformDomains = marketingPlatformDomains
+        self.mixedDomains = mixedDomains
     }
 
     // MARK: - Matching Methods
 
-    /// Check if a domain is a known promotional sender
-    public func isPromotionalDomain(_ domain: String) -> Bool {
+    /// Subdomains that genuinely indicate marketing intent.
+    private static let discriminatingPromoSubdomains: Set<String> = [
+        "promo", "offers", "deals", "marketing", "campaign", "newsletter",
+    ]
+
+    /// Subdomains that indicate only "this is bulk transport" — used by banks,
+    /// utilities and insurers as much as by retailers. Weak evidence on their own.
+    private static let genericTransportSubdomains: Set<String> = [
+        "email", "mail",
+    ]
+
+    /// Classify how strongly a domain looks promotional.
+    public func promotionalMatch(_ domain: String) -> DomainMatchStrength {
         let d = domain.lowercased()
-        if promotionalDomains.contains(d) { return true }
 
-        // Check if sent via marketing platform
-        if marketingPlatformDomains.contains(d) { return true }
+        // Explicitly listed, or the registrable parent is (mail.walmart.com -> walmart.com)
+        if promotionalDomains.contains(d) { return .explicit }
+        if marketingPlatformDomains.contains(d) { return .platform }
 
-        // Check subdomain patterns (e.g., email.store.com, promo.brand.com)
         let parts = d.components(separatedBy: ".")
         if parts.count > 2 {
+            let parent = parts.suffix(2).joined(separator: ".")
+            if promotionalDomains.contains(parent) { return .explicit }
+            if marketingPlatformDomains.contains(parent) { return .platform }
+
             let subdomain = parts[0]
-            let promoSubdomains = ["email", "mail", "promo", "offers", "deals", "marketing", "campaign", "newsletter"]
-            if promoSubdomains.contains(subdomain) { return true }
+            if Self.discriminatingPromoSubdomains.contains(subdomain) { return .explicit }
+            if Self.genericTransportSubdomains.contains(subdomain) { return .generic }
         }
 
+        return .none
+    }
+
+    /// Check if a domain is a known promotional sender.
+    ///
+    /// Kept as a boolean for call sites that only need "did anything match". Use
+    /// ``promotionalMatch(_:)`` when the answer should influence the safety tier.
+    public func isPromotionalDomain(_ domain: String) -> Bool {
+        promotionalMatch(domain) != .none
+    }
+
+    /// Whether this sender is known to send both promotional and transactional mail,
+    /// meaning the domain alone is not sufficient to categorize it.
+    public func isMixedSender(domain: String) -> Bool {
+        let d = domain.lowercased()
+        if mixedDomains.contains(d) { return true }
+        let parts = d.components(separatedBy: ".")
+        if parts.count > 2 {
+            return mixedDomains.contains(parts.suffix(2).joined(separator: "."))
+        }
         return false
     }
 
@@ -199,6 +266,32 @@ public struct SenderPatternDatabase: Sendable {
 
         // Healthcare
         "myhealth.com", "zocdoc.com", "onemedical.com",
+    ]
+
+    /// Senders that ship both marketing and transactional mail from one domain.
+    /// Listed here so the engine disambiguates by subject instead of guessing from the domain.
+    /// These deliberately also appear in the promotional/transactional sets so that the
+    /// boolean domain checks keep reporting a match.
+    private static let defaultMixedDomains: Set<String> = [
+        "amazon.com",
+        "apple.com",
+        "google.com",
+        "microsoft.com",
+        "paypal.com",
+        "ebay.com",
+        "booking.com",
+        "airbnb.com",
+        "uber.com",
+        "ubereats.com",
+        "doordash.com",
+        "instacart.com",
+        "netflix.com",
+        "spotify.com",
+        "etsy.com",
+        "walmart.com",
+        "target.com",
+        "bestbuy.com",
+        "costco.com",
     ]
 
     private static let defaultMarketingPlatformDomains: Set<String> = [

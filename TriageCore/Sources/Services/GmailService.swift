@@ -186,6 +186,50 @@ public actor GmailService {
         }
     }
 
+    // MARK: - Contact Detection
+
+    /// Build a contact list from the user's own SENT mail.
+    ///
+    /// Anyone the user has written to is a real correspondent — this is the strongest
+    /// signal available for the protected tier, and far more reliable than guessing
+    /// from inbound patterns. Capped because a long-lived mailbox can hold tens of
+    /// thousands of sent messages and the contact set saturates quickly.
+    ///
+    /// `ownAddress` is excluded: the user is not their own contact, and self-addressed
+    /// mail (notes-to-self, mailing list echoes) would otherwise dominate the counts.
+    public func fetchSentMailContacts(
+        accountId: Int64,
+        ownAddress: String,
+        maxMessages: Int = 2000
+    ) async throws -> [KnownContact] {
+        let ids = try await client.listAllMessageIds(query: "in:sent")
+        guard !ids.isEmpty else { return [] }
+
+        let capped = Array(ids.prefix(maxMessages))
+        let own = ownAddress.lowercased()
+
+        var counts: [String: Int] = [:]
+        let stream = client.batchGetMessages(ids: capped)
+        for try await batch in stream {
+            for message in batch {
+                for address in message.recipientAddresses {
+                    let normalized = address.lowercased()
+                    guard normalized != own, normalized.contains("@") else { continue }
+                    counts[normalized, default: 0] += 1
+                }
+            }
+        }
+
+        return counts.map { email, count in
+            KnownContact(
+                accountId: accountId,
+                email: email,
+                source: .sentMail,
+                occurrences: count
+            )
+        }
+    }
+
     // MARK: - Conversion
 
     private func convertToMetadata(message: GmailMessage, accountId: Int64) -> EmailMetadata? {

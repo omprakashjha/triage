@@ -63,10 +63,10 @@ public final class AppDatabase: Sendable {
     private func migrate() throws {
         var migrator = DatabaseMigrator()
 
-        #if DEBUG
-        // Speed up development by resetting on schema change
-        migrator.eraseDatabaseOnSchemaChange = true
-        #endif
+        // NOTE: `eraseDatabaseOnSchemaChange` was deliberately REMOVED.
+        // It silently destroys the user's scanned mailbox (and their contact list,
+        // which needs network calls to rebuild) on any schema edit during development.
+        // Additive migrations below are cheap to write and non-destructive.
 
         migrator.registerMigration("v1_initial") { db in
             // Accounts table
@@ -145,6 +145,34 @@ public final class AppDatabase: Sendable {
                 t.column("executedAt", .datetime).notNull()
                 t.column("reversedAt", .datetime)
                 t.column("description", .text).notNull()
+            }
+        }
+
+        migrator.registerMigration("v2_contacts_and_reason") { db in
+            // Persisted contact list. Without this, contact detection has to re-run
+            // network calls on every scan, and an empty set disables the protected tier.
+            try db.create(table: "knownContact") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("email", .text).notNull()
+                t.column("source", .text).notNull()
+                t.column("occurrences", .integer).notNull().defaults(to: 1)
+                t.column("addedAt", .datetime).notNull()
+
+                t.uniqueKey(["accountId", "email"])
+            }
+
+            try db.create(
+                index: "idx_knownContact_accountId",
+                on: "knownContact",
+                columns: ["accountId"]
+            )
+
+            // The engine already computes a human-readable reason for every decision;
+            // it was being discarded instead of stored, so the UI could never show it.
+            try db.alter(table: "emailMetadata") { t in
+                t.add(column: "categoryReason", .text)
             }
         }
 
@@ -337,13 +365,15 @@ extension AppDatabase {
                 try db.execute(
                     sql: """
                         UPDATE emailMetadata
-                        SET category = ?, safetyTier = ?, categoryConfidence = ?, updatedAt = ?
+                        SET category = ?, safetyTier = ?, categoryConfidence = ?,
+                            categoryReason = ?, updatedAt = ?
                         WHERE messageId = ? AND accountId = ?
                         """,
                     arguments: [
                         result.category.rawValue,
                         result.safetyTier.rawValue,
                         result.confidence,
+                        result.reason,
                         Date(),
                         result.messageId,
                         accountId
@@ -419,6 +449,115 @@ extension AppDatabase {
                 categoryBreakdown: categories,
                 tierBreakdown: tiers
             )
+        }
+    }
+}
+
+// MARK: - Known Contact Operations
+
+extension AppDatabase {
+    /// The lowercased address set used to drive the protected tier.
+    public func knownContactEmails(accountId: Int64) async throws -> Set<String> {
+        try await dbWriter.read { db in
+            let emails = try String.fetchAll(
+                db,
+                sql: "SELECT email FROM knownContact WHERE accountId = ?",
+                arguments: [accountId]
+            )
+            return Set(emails.map { $0.lowercased() })
+        }
+    }
+
+    public func fetchKnownContacts(accountId: Int64) async throws -> [KnownContact] {
+        try await dbWriter.read { db in
+            try KnownContact
+                .filter(KnownContact.Columns.accountId == accountId)
+                .order(KnownContact.Columns.occurrences.desc)
+                .fetchAll(db)
+        }
+    }
+
+    /// Upsert detected contacts.
+    ///
+    /// A `manual` entry is never downgraded by re-detection — the user pinning an
+    /// address outranks any heuristic that later disagrees.
+    public func saveKnownContacts(_ contacts: [KnownContact]) async throws {
+        guard !contacts.isEmpty else { return }
+        try await dbWriter.write { db in
+            for contact in contacts {
+                try db.execute(
+                    sql: """
+                        INSERT INTO knownContact (accountId, email, source, occurrences, addedAt)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(accountId, email) DO UPDATE SET
+                            occurrences = knownContact.occurrences + excluded.occurrences,
+                            source = CASE
+                                WHEN knownContact.source = 'manual' THEN 'manual'
+                                ELSE excluded.source
+                            END
+                        """,
+                    arguments: [
+                        contact.accountId,
+                        contact.email.lowercased(),
+                        contact.source.rawValue,
+                        contact.occurrences,
+                        contact.addedAt
+                    ]
+                )
+            }
+        }
+    }
+
+    /// Pin an address by hand so its mail is always protected.
+    public func addManualContact(email: String, accountId: Int64) async throws {
+        try await saveKnownContacts([
+            KnownContact(accountId: accountId, email: email, source: .manual, occurrences: 1)
+        ])
+    }
+
+    public func removeKnownContact(email: String, accountId: Int64) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: "DELETE FROM knownContact WHERE accountId = ? AND LOWER(email) = ?",
+                arguments: [accountId, email.lowercased()]
+            )
+        }
+    }
+
+    /// Senders of mail that Gmail itself classified as personal.
+    ///
+    /// Gmail's own `CATEGORY_PERSONAL` label is a useful independent signal. The label
+    /// list is stored as JSON, so this filters in Swift rather than in SQL.
+    public func sendersWithGmailPersonalLabel(accountId: Int64, limit: Int = 20000) async throws -> [String: Int] {
+        let emails = try await fetchEmails(accountId: accountId, limit: limit, offset: 0)
+        var counts: [String: Int] = [:]
+        for email in emails {
+            guard let labels = email.labels else { continue }
+            guard labels.contains("CATEGORY_PERSONAL") else { continue }
+            counts[email.senderEmail.lowercased(), default: 0] += 1
+        }
+        return counts
+    }
+
+    /// The review queue, weakest-confidence first.
+    ///
+    /// Ascending confidence is the correct order for human review: it puts the
+    /// engine's least certain decisions in front of the user first, instead of
+    /// burying them under decisions that needed no attention.
+    public func fetchEmailsForReview(
+        accountId: Int64,
+        limit: Int = 500
+    ) async throws -> [EmailMetadata] {
+        try await dbWriter.read { db in
+            try EmailMetadata
+                .filter(EmailMetadata.Columns.accountId == accountId)
+                .filter(EmailMetadata.Columns.safetyTier == SafetyTier.review.rawValue)
+                .order(
+                    EmailMetadata.Columns.categoryConfidence.ascNullsLast,
+                    EmailMetadata.Columns.date.desc
+                )
+                .limit(limit)
+                .fetchAll(db)
         }
     }
 }

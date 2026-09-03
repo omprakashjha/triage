@@ -15,48 +15,70 @@ public actor ContactDetector {
         knownContacts
     }
 
-    /// Build the contacts list from all available sources
+    /// Rebuild the contact list for an account from all available evidence and persist it.
+    ///
+    /// Returns the lowercased address set to hand to `RuleBasedEngine(knownContacts:)`.
+    /// This is the call that makes the `.protected_` tier reachable at all — with an
+    /// empty set, the engine's highest-priority rule can never fire.
+    ///
+    /// `sentMailContacts` is supplied by the provider layer (see
+    /// `GmailService.fetchSentMailContacts`) so this type stays network-free and testable.
+    public func refreshAndPersist(
+        accountId: Int64,
+        sentMailContacts: [KnownContact] = [],
+        manualContacts: Set<String> = []
+    ) async throws -> Set<String> {
+        var toSave: [KnownContact] = sentMailContacts
+
+        // Gmail's own personal classification, as an independent second source.
+        let personalSenders = try await database.sendersWithGmailPersonalLabel(accountId: accountId)
+        for (email, count) in personalSenders {
+            toSave.append(
+                KnownContact(
+                    accountId: accountId,
+                    email: email,
+                    source: .gmailPersonalLabel,
+                    occurrences: count
+                )
+            )
+        }
+
+        for email in manualContacts {
+            toSave.append(
+                KnownContact(accountId: accountId, email: email, source: .manual)
+            )
+        }
+
+        try await database.saveKnownContacts(toSave)
+
+        let persisted = try await database.knownContactEmails(accountId: accountId)
+        knownContacts = persisted
+        return persisted
+    }
+
+    /// Load the already-persisted contact set without doing any detection work.
+    /// Used on every scan after the first, so categorization never runs contact-blind.
+    public func loadPersistedContacts(accountId: Int64) async throws -> Set<String> {
+        let persisted = try await database.knownContactEmails(accountId: accountId)
+        knownContacts = persisted
+        return persisted
+    }
+
+    /// Merge explicitly-supplied address sources into one normalized set.
+    ///
+    /// Kept for callers (Yahoo/IMAP) that can enumerate sent recipients themselves.
+    /// NOTE: an earlier version of this method also consulted a `detectReplyContacts()`
+    /// helper that unconditionally returned an empty set — it has been removed rather
+    /// than left in place looking like a working source.
     public func buildContactList(
-        gmailSentLabels: [EmailMetadata] = [],
         yahooSentRecipients: Set<String> = [],
         manualContacts: Set<String> = []
-    ) async -> Set<String> {
+    ) -> Set<String> {
         var contacts: Set<String> = []
-
-        // Source 1: Yahoo sent folder recipients
         contacts.formUnion(yahooSentRecipients)
-
-        // Source 2: Gmail sent emails (from cached metadata with "SENT" label)
-        let gmailRecipients = extractGmailSentRecipients(from: gmailSentLabels)
-        contacts.formUnion(gmailRecipients)
-
-        // Source 3: Manual contacts
         contacts.formUnion(manualContacts)
-
-        // Source 4: Reply detection — senders the user has exchanged emails with
-        let replyContacts = await detectReplyContacts()
-        contacts.formUnion(replyContacts)
-
-        // Normalize all to lowercase
         knownContacts = Set(contacts.map { $0.lowercased() })
         return knownContacts
-    }
-
-    /// Detect contacts by finding sender addresses that appear in multiple threads
-    /// (heuristic: if someone emails you and you email them back, they're a contact)
-    private func detectReplyContacts() async -> Set<String> {
-        // Look for senders who the user has interacted with frequently
-        // This is approximated by finding senders with emails in multiple threads
-        // For a more precise approach, we'd need the Sent folder analysis
-        return []
-    }
-
-    /// Extract recipients from Gmail sent emails (emails with "SENT" label)
-    private func extractGmailSentRecipients(from sentEmails: [EmailMetadata]) -> Set<String> {
-        // In Gmail, sent emails have the user as sender — but we store the "To" recipients
-        // For now, we mark the sender of any email that was in "SENT" as a contact
-        // because it means the user sent something to them
-        Set(sentEmails.map { $0.senderEmail.lowercased() })
     }
 
     /// Analyze sender frequency — senders who email frequently are likely subscriptions, not contacts

@@ -95,7 +95,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         }
 
         // Rule 5: Automated sender detection (noreply, no-reply, etc.)
-        if isAutomatedSender(email) {
+        switch automatedSenderStrength(email) {
+        case .strong:
             return CategorizationResult(
                 messageId: email.messageId,
                 category: .notification,
@@ -103,6 +104,18 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 confidence: 0.7,
                 reason: "Automated sender (noreply/no-reply)"
             )
+        case .weak:
+            // `info@`, `auto…`, `news…` are frequently real people at small businesses.
+            // Categorize, but never auto-delete on this evidence alone.
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .notification,
+                safetyTier: .review,
+                confidence: 0.45,
+                reason: "Possibly automated sender — ambiguous local part, needs review"
+            )
+        case .none:
+            break
         }
 
         // Fallback: Unknown
@@ -121,11 +134,42 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         knownContacts.contains(email.senderEmail.lowercased())
     }
 
+    /// Classify an email that carries a `List-Unsubscribe` header.
+    ///
+    /// The header is strong evidence of *bulk* mail but NOT evidence of *disposable* mail:
+    /// order confirmations and statements increasingly ship one-click unsubscribe too. So a
+    /// transactional subject wins over the header.
     private func classifyWithUnsubscribe(_ email: EmailMetadata) -> CategorizationResult {
         let domain = EmailHeaderParser.extractDomain(email.senderEmail)
 
-        // Check if it's a promotional domain even though it has unsubscribe
-        if senderPatterns.isPromotionalDomain(domain) {
+        // A receipt with an unsubscribe link is still a receipt.
+        if Self.subjectSuggestsTransactional(email.subject) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .transactional,
+                safetyTier: .review,
+                confidence: 0.7,
+                reason: "Transactional subject, despite a List-Unsubscribe header"
+            )
+        }
+
+        // Mixed senders get the subject tie-breaker.
+        if senderPatterns.isMixedSender(domain: domain) {
+            return classifyMixedSender(email, domain: domain)
+        }
+
+        if senderPatterns.isTransactionalDomain(domain) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .transactional,
+                safetyTier: .review,
+                confidence: 0.7,
+                reason: "Transactional sender with a List-Unsubscribe header"
+            )
+        }
+
+        // Only strong promotional evidence justifies the auto-actionable tier.
+        if senderPatterns.promotionalMatch(domain).isStrong {
             return CategorizationResult(
                 messageId: email.messageId,
                 category: .promotion,
@@ -145,44 +189,24 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         )
     }
 
+    /// Sender-based classification.
+    ///
+    /// Order is deliberate and load-bearing:
+    /// 1. mixed senders (Amazon et al) — domain cannot decide, ask the subject
+    /// 2. transactional — before promotional, so `mail.chase.com` is not swept up by
+    ///    the generic `mail.` subdomain heuristic
+    /// 3. STRONG promotional (explicitly listed domain or marketing platform)
+    /// 4. notification / social — real signals, must beat a generic subdomain guess
+    /// 5. WEAK promotional (generic `mail.`/`email.` transport only) → review, never auto-delete
     private func matchSenderPattern(_ email: EmailMetadata) -> CategorizationResult? {
         let domain = EmailHeaderParser.extractDomain(email.senderEmail)
-        let localPart = email.senderEmail.components(separatedBy: "@").first ?? ""
 
-        // Promotional domains
-        if senderPatterns.isPromotionalDomain(domain) {
-            return CategorizationResult(
-                messageId: email.messageId,
-                category: .promotion,
-                safetyTier: .safe,
-                confidence: 0.85,
-                reason: "Known promotional sender domain"
-            )
+        // 1. Mixed senders: the domain sends both kinds, so break the tie on the subject.
+        if senderPatterns.isMixedSender(domain: domain) {
+            return classifyMixedSender(email, domain: domain)
         }
 
-        // Notification patterns
-        if senderPatterns.isNotificationSender(email: email.senderEmail, domain: domain) {
-            return CategorizationResult(
-                messageId: email.messageId,
-                category: .notification,
-                safetyTier: .safe,
-                confidence: 0.8,
-                reason: "Known notification sender"
-            )
-        }
-
-        // Social media
-        if senderPatterns.isSocialPlatform(domain: domain) {
-            return CategorizationResult(
-                messageId: email.messageId,
-                category: .social,
-                safetyTier: .safe,
-                confidence: 0.9,
-                reason: "Social media platform"
-            )
-        }
-
-        // Transactional (receipts, shipping, banking)
+        // 2. Transactional before promotional.
         if senderPatterns.isTransactionalDomain(domain) {
             return CategorizationResult(
                 messageId: email.messageId,
@@ -193,56 +217,141 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
             )
         }
 
+        let promoStrength = senderPatterns.promotionalMatch(domain)
+
+        // 3. Strong promotional evidence.
+        if promoStrength.isStrong {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .promotion,
+                safetyTier: .safe,
+                confidence: 0.85,
+                reason: promoStrength == .platform
+                    ? "Sent via a bulk-marketing platform"
+                    : "Known promotional sender domain"
+            )
+        }
+
+        // 4. Notification and social outrank a generic-subdomain guess.
+        if senderPatterns.isNotificationSender(email: email.senderEmail, domain: domain) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .notification,
+                safetyTier: .safe,
+                confidence: 0.8,
+                reason: "Known notification sender"
+            )
+        }
+
+        if senderPatterns.isSocialPlatform(domain: domain) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .social,
+                safetyTier: .safe,
+                confidence: 0.9,
+                reason: "Social media platform"
+            )
+        }
+
+        // 5. Weak evidence only: categorize but require approval.
+        if promoStrength == .generic {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .promotion,
+                safetyTier: .review,
+                confidence: 0.5,
+                reason: "Generic bulk-mail subdomain (\(domain)) — weak signal, needs review"
+            )
+        }
+
         return nil
+    }
+
+    /// Decide a mixed sender (one domain, both promotional and transactional mail) by subject.
+    ///
+    /// When the subject gives no signal we return promotion but at `.review`, because
+    /// the cost of deleting an order record far exceeds the cost of one extra approval.
+    private func classifyMixedSender(_ email: EmailMetadata, domain: String) -> CategorizationResult {
+        if Self.subjectSuggestsTransactional(email.subject) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .transactional,
+                safetyTier: .review,
+                confidence: 0.8,
+                reason: "Mixed sender (\(domain)) with a transactional subject"
+            )
+        }
+
+        if Self.subjectSuggestsPromotional(email.subject) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .promotion,
+                safetyTier: .safe,
+                confidence: 0.8,
+                reason: "Mixed sender (\(domain)) with a promotional subject"
+            )
+        }
+
+        return CategorizationResult(
+            messageId: email.messageId,
+            category: .promotion,
+            safetyTier: .review,
+            confidence: 0.45,
+            reason: "Mixed sender (\(domain)) — subject is ambiguous, needs review"
+        )
+    }
+
+    // MARK: - Subject Pattern Data
+
+    /// Hoisted to type level so the mixed-sender tie-breaker can reuse them
+    /// without re-running full categorization.
+    static let promotionalSubjectPatterns = [
+        "% off", "sale", "deal", "discount", "limited time",
+        "flash sale", "buy now", "shop now", "free shipping",
+        "exclusive offer", "save up to", "clearance",
+        "black friday", "cyber monday", "promo code",
+    ]
+
+    static let notificationSubjectPatterns = [
+        "password reset", "verify your", "confirm your",
+        "security alert", "login attempt", "new sign-in",
+        "account update", "action required",
+    ]
+
+    /// Note: order matters against ``notificationSubjectPatterns``. Shipping and order
+    /// subjects live here because losing an order record is worse than over-retaining
+    /// a notification.
+    static let transactionalSubjectPatterns = [
+        "receipt", "invoice", "payment", "statement",
+        "your bill", "subscription", "renewal",
+        "your order", "order confirmation", "shipping confirmation",
+        "delivery update", "has shipped", "refund",
+    ]
+
+    static let newsletterSubjectPatterns = [
+        "weekly digest", "daily digest", "newsletter",
+        "this week in", "monthly update", "weekly roundup",
+        "issue #", "edition", "digest",
+    ]
+
+    /// True when the subject carries a record-keeping signal (receipt, order, invoice).
+    static func subjectSuggestsTransactional(_ subject: String) -> Bool {
+        let s = subject.lowercased()
+        return transactionalSubjectPatterns.contains { s.contains($0) }
+    }
+
+    /// True when the subject carries an unambiguous marketing signal.
+    static func subjectSuggestsPromotional(_ subject: String) -> Bool {
+        let s = subject.lowercased()
+        return promotionalSubjectPatterns.contains { s.contains($0) }
     }
 
     private func matchSubjectPattern(_ email: EmailMetadata) -> CategorizationResult? {
         let subject = email.subject.lowercased()
 
-        // Promotional subject patterns
-        let promoPatterns = [
-            "% off", "sale", "deal", "discount", "limited time",
-            "flash sale", "buy now", "shop now", "free shipping",
-            "exclusive offer", "save up to", "clearance",
-            "black friday", "cyber monday", "promo code",
-        ]
-        for pattern in promoPatterns {
-            if subject.contains(pattern) {
-                return CategorizationResult(
-                    messageId: email.messageId,
-                    category: .promotion,
-                    safetyTier: .safe,
-                    confidence: 0.7,
-                    reason: "Promotional subject pattern: \"\(pattern)\""
-                )
-            }
-        }
-
-        // Notification subject patterns
-        let notificationPatterns = [
-            "your order", "shipping confirmation", "delivery update",
-            "password reset", "verify your", "confirm your",
-            "security alert", "login attempt", "new sign-in",
-            "account update", "action required",
-        ]
-        for pattern in notificationPatterns {
-            if subject.contains(pattern) {
-                return CategorizationResult(
-                    messageId: email.messageId,
-                    category: .notification,
-                    safetyTier: .review,
-                    confidence: 0.7,
-                    reason: "Notification subject pattern: \"\(pattern)\""
-                )
-            }
-        }
-
-        // Transactional subject patterns
-        let transactionalPatterns = [
-            "receipt", "invoice", "payment", "statement",
-            "your bill", "subscription", "renewal",
-        ]
-        for pattern in transactionalPatterns {
+        // Transactional first: a receipt misfiled as a promotion gets deleted,
+        // a promotion misfiled as a receipt only survives an extra cycle.
+        for pattern in Self.transactionalSubjectPatterns {
             if subject.contains(pattern) {
                 return CategorizationResult(
                     messageId: email.messageId,
@@ -254,13 +363,31 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
             }
         }
 
-        // Newsletter subject patterns
-        let newsletterPatterns = [
-            "weekly digest", "daily digest", "newsletter",
-            "this week in", "monthly update", "weekly roundup",
-            "issue #", "edition", "digest",
-        ]
-        for pattern in newsletterPatterns {
+        for pattern in Self.promotionalSubjectPatterns {
+            if subject.contains(pattern) {
+                return CategorizationResult(
+                    messageId: email.messageId,
+                    category: .promotion,
+                    safetyTier: .safe,
+                    confidence: 0.7,
+                    reason: "Promotional subject pattern: \"\(pattern)\""
+                )
+            }
+        }
+
+        for pattern in Self.notificationSubjectPatterns {
+            if subject.contains(pattern) {
+                return CategorizationResult(
+                    messageId: email.messageId,
+                    category: .notification,
+                    safetyTier: .review,
+                    confidence: 0.7,
+                    reason: "Notification subject pattern: \"\(pattern)\""
+                )
+            }
+        }
+
+        for pattern in Self.newsletterSubjectPatterns {
             if subject.contains(pattern) {
                 return CategorizationResult(
                     messageId: email.messageId,
@@ -275,14 +402,48 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         return nil
     }
 
-    private func isAutomatedSender(_ email: EmailMetadata) -> Bool {
-        let localPart = email.senderEmail.components(separatedBy: "@").first ?? ""
-        let automatedPrefixes = [
-            "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
-            "notifications", "notification", "alerts", "alert",
-            "mailer", "automail", "auto", "system", "info",
-            "updates", "news", "marketing", "promo",
-        ]
-        return automatedPrefixes.contains { localPart.lowercased().hasPrefix($0) }
+    /// How confident we are that a local part denotes an unattended mailbox.
+    enum AutomatedSenderStrength {
+        /// Unambiguous — nobody reads `noreply@`.
+        case strong
+        /// Ambiguous — `info@`, `auto…`, `news…` are also real people at small businesses.
+        case weak
+        case none
+    }
+
+    /// Local parts that are never a human.
+    private static let strongAutomatedTokens: Set<String> = [
+        "noreply", "no-reply", "no_reply", "donotreply", "do-not-reply",
+        "do_not_reply", "notifications", "notification", "mailer-daemon",
+        "mailerdaemon", "postmaster", "bounce", "bounces",
+    ]
+
+    /// Local parts that *often* denote automation but are genuinely used by people.
+    private static let weakAutomatedTokens: Set<String> = [
+        "alerts", "alert", "mailer", "automail", "auto", "system", "info",
+        "updates", "news", "marketing", "promo", "hello", "contact", "support",
+    ]
+
+    /// Match a token against a local part on a token boundary, so `news` matches
+    /// `news@` and `news-digest@` but NOT `newsome@` (a surname).
+    private static func localPart(_ localPart: String, matchesToken token: String) -> Bool {
+        if localPart == token { return true }
+        guard localPart.hasPrefix(token) else { return false }
+        let next = localPart[localPart.index(localPart.startIndex, offsetBy: token.count)]
+        // Only a separator continues an automated token; a letter means a different word.
+        return next == "-" || next == "_" || next == "." || next.isNumber || next == "+"
+    }
+
+    private func automatedSenderStrength(_ email: EmailMetadata) -> AutomatedSenderStrength {
+        let local = (email.senderEmail.components(separatedBy: "@").first ?? "").lowercased()
+        guard !local.isEmpty else { return .none }
+
+        if Self.strongAutomatedTokens.contains(where: { Self.localPart(local, matchesToken: $0) }) {
+            return .strong
+        }
+        if Self.weakAutomatedTokens.contains(where: { Self.localPart(local, matchesToken: $0) }) {
+            return .weak
+        }
+        return .none
     }
 }

@@ -66,7 +66,7 @@ public actor GmailAPIClient {
 
     /// Fetch metadata for a single message
     public func getMessage(id: String) async throws -> GmailMessage {
-        let url = URL(string: "\(baseURL)/messages/\(id)?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=Reply-To")!
+        let url = URL(string: "\(baseURL)/messages/\(id)?format=metadata&metadataHeaders=From&metadataHeaders=To&metadataHeaders=Cc&metadataHeaders=Subject&metadataHeaders=Date&metadataHeaders=List-Unsubscribe&metadataHeaders=List-Unsubscribe-Post&metadataHeaders=Reply-To")!
 
         let data = try await authenticatedRequest(url: url)
         return try JSONDecoder().decode(GmailMessage.self, from: data)
@@ -281,6 +281,34 @@ public struct GmailMessage: Decodable, Sendable {
 
     public var listUnsubscribe: String? {
         payload?.headers?.first(where: { $0.name.lowercased() == "list-unsubscribe" })?.value
+    }
+
+    /// Presence of this header (per RFC 8058) means the unsubscribe URL accepts a
+    /// one-click POST, which is what makes automated unsubscribe safe to attempt.
+    public var listUnsubscribePost: String? {
+        payload?.headers?.first(where: { $0.name.lowercased() == "list-unsubscribe-post" })?.value
+    }
+
+    public var supportsOneClickUnsubscribe: Bool {
+        listUnsubscribePost?.lowercased().contains("one-click") ?? false
+    }
+
+    public var to: String? {
+        payload?.headers?.first(where: { $0.name.lowercased() == "to" })?.value
+    }
+
+    public var cc: String? {
+        payload?.headers?.first(where: { $0.name.lowercased() == "cc" })?.value
+    }
+
+    /// Every address this message was addressed to (To + Cc), lowercased.
+    /// For messages in SENT, these are people the user has written to — the strongest
+    /// available signal that an address belongs to a real correspondent.
+    public var recipientAddresses: [String] {
+        var all: [String] = []
+        if let to { all += EmailHeaderParser.parseAddressList(to) }
+        if let cc { all += EmailHeaderParser.parseAddressList(cc) }
+        return all
     }
 
     public var replyTo: String? {
