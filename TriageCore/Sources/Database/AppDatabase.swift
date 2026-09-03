@@ -256,6 +256,23 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v6_golden_labels") { db in
+            // Human ground truth for measuring the engine. Sender-level, because the
+            // top ~100 senders cover most of a large mailbox.
+            try db.create(table: "goldenLabel") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("senderEmail", .text).notNull()
+                t.column("expectedCategory", .text).notNull()
+                t.column("disposition", .text).notNull()
+                t.column("note", .text)
+                t.column("labelledAt", .datetime).notNull()
+
+                t.uniqueKey(["accountId", "senderEmail"])
+            }
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -1008,6 +1025,100 @@ extension AppDatabase {
             }
             return ignoring
         }
+    }
+}
+
+// MARK: - Golden Labels & Evaluation
+
+extension AppDatabase {
+    public func fetchGoldenLabels(accountId: Int64) async throws -> [GoldenLabel] {
+        try await dbWriter.read { db in
+            try GoldenLabel
+                .filter(GoldenLabel.Columns.accountId == accountId)
+                .order(GoldenLabel.Columns.labelledAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    public func saveGoldenLabel(_ label: GoldenLabel) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO goldenLabel
+                        (accountId, senderEmail, expectedCategory, disposition, note, labelledAt)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(accountId, senderEmail) DO UPDATE SET
+                        expectedCategory = excluded.expectedCategory,
+                        disposition = excluded.disposition,
+                        note = excluded.note,
+                        labelledAt = excluded.labelledAt
+                    """,
+                arguments: [
+                    label.accountId,
+                    label.senderEmail.lowercased(),
+                    label.expectedCategory.rawValue,
+                    label.disposition.rawValue,
+                    label.note,
+                    label.labelledAt
+                ]
+            )
+        }
+    }
+
+    public func deleteGoldenLabel(accountId: Int64, senderEmail: String) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: "DELETE FROM goldenLabel WHERE accountId = ? AND LOWER(senderEmail) = ?",
+                arguments: [accountId, senderEmail.lowercased()]
+            )
+        }
+    }
+
+    /// Run the evaluation harness over every labelled sender's mail.
+    ///
+    /// Re-runs categorization rather than reading the stored decisions, so the report
+    /// reflects the engine as it behaves NOW — otherwise a rule change would not show
+    /// up until the whole mailbox was re-categorized.
+    public func evaluate(
+        accountId: Int64,
+        engine: CategorizationEngine,
+        rules: ActionRules
+    ) async throws -> EvaluationReport {
+        let labels = try await fetchGoldenLabels(accountId: accountId)
+        guard !labels.isEmpty else {
+            return CategorizationEvaluator(rules: rules)
+                .evaluate(emails: [], results: [], labels: [], accountId: accountId)
+        }
+
+        let labelledSenders = Set(labels.map { $0.senderEmail.lowercased() })
+        let all = try await fetchEmails(accountId: accountId, includeExecuted: true, limit: 50000)
+        let relevant = all.filter { labelledSenders.contains($0.senderEmail.lowercased()) }
+
+        let results = try await engine.categorize(emails: relevant)
+
+        return CategorizationEvaluator(rules: rules).evaluate(
+            emails: relevant,
+            results: results,
+            labels: labels,
+            accountId: accountId
+        )
+    }
+
+    /// Export the golden set so it can be committed as a repo fixture rather than
+    /// living only in one machine's database.
+    public func exportGoldenSet(accountId: Int64, accountEmail: String) async throws -> GoldenSetExport {
+        let labels = try await fetchGoldenLabels(accountId: accountId)
+        return GoldenSetExport(
+            accountEmail: accountEmail,
+            labels: labels.map {
+                GoldenSetExport.ExportedLabel(
+                    senderEmail: $0.senderEmail,
+                    expectedCategory: $0.expectedCategory.rawValue,
+                    disposition: $0.disposition.rawValue,
+                    note: $0.note
+                )
+            }
+        )
     }
 }
 

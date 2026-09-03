@@ -21,6 +21,8 @@ struct ContentView: View {
                     SenderTriageView()
                 case .history:
                     HistoryView()
+                case .evaluation:
+                    EvaluationView()
                 case .settings:
                     SettingsView()
                 }
@@ -69,6 +71,11 @@ struct SidebarView: View {
                     title: "History",
                     systemImage: "clock.arrow.circlepath",
                     route: .history
+                )
+                SidebarRouteRow(
+                    title: "Accuracy",
+                    systemImage: "chart.bar.doc.horizontal",
+                    route: .evaluation
                 )
                 SidebarRouteRow(
                     title: "Settings",

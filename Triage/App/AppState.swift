@@ -12,10 +12,15 @@ final class AppState: ObservableObject {
         case overview
         case senders
         case history
+        case evaluation
         case settings
     }
 
     @Published var detailRoute: DetailRoute = .overview
+    @Published var goldenLabels: [GoldenLabel] = []
+    @Published var evaluationReport: EvaluationReport?
+    @Published var isEvaluating = false
+    @Published var exportedGoldenSetPath: String?
     @Published var senderSummaries: [SenderSummary] = []
     @Published var senderRules: [SenderRule] = []
     @Published var settings: AccountSettings?
@@ -496,6 +501,90 @@ final class AppState: ObservableObject {
 
     func loadIgnoredUnsubscribes(accountId: Int64) async {
         sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
+    }
+
+    // MARK: - Golden Set & Evaluation
+
+    func loadGoldenLabels(accountId: Int64) async {
+        goldenLabels = (try? await database.fetchGoldenLabels(accountId: accountId)) ?? []
+    }
+
+    /// Record a human judgement about a sender for the evaluation set.
+    func labelSender(
+        _ senderEmail: String,
+        expectedCategory: EmailCategory,
+        disposition: Disposition,
+        note: String? = nil,
+        accountId: Int64
+    ) async {
+        do {
+            try await database.saveGoldenLabel(
+                GoldenLabel(
+                    accountId: accountId,
+                    senderEmail: senderEmail,
+                    expectedCategory: expectedCategory,
+                    disposition: disposition,
+                    note: note
+                )
+            )
+            await loadGoldenLabels(accountId: accountId)
+        } catch {
+            lastExecutionError = "Failed to save label: \(error.localizedDescription)"
+        }
+    }
+
+    func removeGoldenLabel(senderEmail: String, accountId: Int64) async {
+        try? await database.deleteGoldenLabel(accountId: accountId, senderEmail: senderEmail)
+        await loadGoldenLabels(accountId: accountId)
+    }
+
+    /// Measure the current engine against the labelled set.
+    ///
+    /// Re-runs categorization with the live contact list and rules, so a rule change is
+    /// reflected immediately rather than after a full re-categorization.
+    func runEvaluation(accountId: Int64) async {
+        isEvaluating = true
+        defer { isEvaluating = false }
+
+        do {
+            if settings == nil { await loadSettings(accountId: accountId) }
+            let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
+            let engine = RuleBasedEngine(knownContacts: contacts)
+
+            evaluationReport = try await database.evaluate(
+                accountId: accountId,
+                engine: engine,
+                rules: settings?.actionRules ?? .default
+            )
+        } catch {
+            lastExecutionError = "Evaluation failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// Write the golden set to a JSON file so it can be committed as a test fixture.
+    @discardableResult
+    func exportGoldenSet(accountId: Int64) async -> URL? {
+        guard let account = selectedAccount else { return nil }
+        do {
+            let export = try await database.exportGoldenSet(
+                accountId: accountId,
+                accountEmail: account.email
+            )
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+            encoder.dateEncodingStrategy = .iso8601
+            let data = try encoder.encode(export)
+
+            let url = FileManager.default
+                .urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("triage-golden-set.json")
+            try data.write(to: url)
+            exportedGoldenSetPath = url.path
+            return url
+        } catch {
+            lastExecutionError = "Export failed: \(error.localizedDescription)"
+            return nil
+        }
     }
 
     // MARK: - History & Undo

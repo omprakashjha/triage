@@ -254,6 +254,9 @@ struct SenderDecisionSheet: View {
     @State private var persistAsRule = true
     @State private var ruleScope: RuleScope = .address
     @State private var keepNewest = 0
+    @State private var showLabelling = false
+    @State private var labelDisposition: Disposition = .disposable
+    @State private var labelCategory: EmailCategory = .promotion
 
     private var affectedCount: Int {
         max(summary.totalEmails - keepNewest, 0)
@@ -330,6 +333,52 @@ struct SenderDecisionSheet: View {
                 .pickerStyle(.radioGroup)
                 .padding(.leading, 20)
             }
+
+            Divider()
+
+            // Labelling lives here because this is where the user is already forming a
+            // judgement about the sender — asking again on a separate screen would mean
+            // re-deciding from scratch.
+            DisclosureGroup("Label for accuracy testing", isExpanded: $showLabelling) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Your judgement becomes ground truth for measuring the engine. Independent of the action above.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Picker("This sender's mail is", selection: $labelDisposition) {
+                        ForEach(Disposition.allCases, id: \.self) { disposition in
+                            Text(disposition.displayName).tag(disposition)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text(labelDisposition.explanation)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+
+                    Picker("Correct category", selection: $labelCategory) {
+                        ForEach(EmailCategory.allCases, id: \.self) { category in
+                            Text(category.displayName).tag(category)
+                        }
+                    }
+
+                    Button("Save label") {
+                        Task {
+                            if let accountId = appState.selectedAccount?.id {
+                                await appState.labelSender(
+                                    summary.senderEmail,
+                                    expectedCategory: labelCategory,
+                                    disposition: labelDisposition,
+                                    accountId: accountId
+                                )
+                            }
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                }
+                .padding(.top, 6)
+            }
+            .font(.caption)
 
             Divider()
 
