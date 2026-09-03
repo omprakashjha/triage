@@ -16,6 +16,9 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
     // Headers relevant for categorization
     public var hasListUnsubscribe: Bool
     public var listUnsubscribeHeader: String?  // Raw header value for unsubscribe automation
+    /// True when the sender advertised RFC 8058 one-click support via
+    /// `List-Unsubscribe-Post`. Only then is an automated POST appropriate.
+    public var supportsOneClickUnsubscribe: Bool = false
     public var replyTo: String?
 
     // Gmail-specific
@@ -60,6 +63,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         snippet: String? = nil,
         hasListUnsubscribe: Bool = false,
         listUnsubscribeHeader: String? = nil,
+        supportsOneClickUnsubscribe: Bool = false,
         replyTo: String? = nil,
         labels: [String]? = nil,
         isUnread: Bool = true,
@@ -84,6 +88,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         self.snippet = snippet
         self.hasListUnsubscribe = hasListUnsubscribe
         self.listUnsubscribeHeader = listUnsubscribeHeader
+        self.supportsOneClickUnsubscribe = supportsOneClickUnsubscribe
         self.replyTo = replyTo
         self.labels = labels
         self.isUnread = isUnread
@@ -102,7 +107,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
     public enum Columns: String, ColumnExpression {
         case id, accountId, messageId, threadId, sender, senderEmail
         case subject, date, snippet
-        case hasListUnsubscribe, listUnsubscribeHeader, replyTo
+        case hasListUnsubscribe, listUnsubscribeHeader, supportsOneClickUnsubscribe, replyTo
         case labels, isUnread
         case category, safetyTier, categoryConfidence, categoryReason
         case actionTaken, actionDate, actionExecutedAt

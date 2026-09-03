@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import TriageCore
 
 @MainActor
@@ -21,6 +22,9 @@ final class AppState: ObservableObject {
     @Published var isLoadingSenders = false
     /// Count of emails auto-marked by standing sender rules on the last scan.
     @Published var lastRuleMatchCount = 0
+    @Published var unsubscribeMessage: String?
+    /// Senders that kept sending after a successful unsubscribe.
+    @Published var sendersIgnoringUnsubscribe: [String] = []
     @Published var accounts: [EmailAccount] = []
     @Published var scanProgress: ScanProgress?
     @Published var isScanning = false
@@ -40,6 +44,7 @@ final class AppState: ObservableObject {
 
     private let database: AppDatabase
     private let contactDetector: ContactDetector
+    private let unsubscribeService = UnsubscribeService()
     private var gmailService: GmailService?
     private var batchExecutor: BatchExecutor?
 
@@ -425,6 +430,72 @@ final class AppState: ObservableObject {
         updated.actionRules = rules
         settings = updated
         try? await database.saveAccountSettings(updated)
+    }
+
+    // MARK: - Unsubscribe
+
+    /// Attempt to unsubscribe from a sender.
+    ///
+    /// Only ever user-initiated. One-click is attempted only when the sender advertised
+    /// RFC 8058 support; otherwise the web page is opened for the user to complete,
+    /// because a blind POST to a GET-only confirmation page can do the wrong thing.
+    func unsubscribe(from summary: SenderSummary, accountId: Int64) async {
+        unsubscribeMessage = nil
+
+        do {
+            guard let info = try await database.latestUnsubscribeInfo(
+                accountId: accountId,
+                senderEmail: summary.senderEmail
+            ) else {
+                unsubscribeMessage = "No unsubscribe option found for \(summary.senderEmail)."
+                return
+            }
+
+            let outcome = try await unsubscribeService.unsubscribe(
+                header: info.header,
+                supportsOneClick: info.supportsOneClick
+            )
+
+            switch outcome {
+            case .oneClickSucceeded:
+                try await database.recordUnsubscribeAttempt(
+                    UnsubscribeAttempt(
+                        senderEmail: summary.senderEmail,
+                        method: "one-click",
+                        succeeded: true
+                    ),
+                    accountId: accountId
+                )
+                unsubscribeMessage = "Unsubscribed from \(summary.senderEmail). "
+                    + "If mail keeps arriving after 10 days it will be flagged as ignored."
+
+            case .needsBrowser(let url):
+                NSWorkspace.shared.open(url)
+                try await database.recordUnsubscribeAttempt(
+                    UnsubscribeAttempt(
+                        senderEmail: summary.senderEmail,
+                        method: "browser",
+                        succeeded: false,
+                        note: "Opened \(url.host ?? "the sender's page") — needs completing in the browser."
+                    ),
+                    accountId: accountId
+                )
+                unsubscribeMessage = "This sender needs a web page — opened in your browser."
+
+            case .needsEmail(let address):
+                unsubscribeMessage = "This sender only accepts unsubscribe by email. "
+                    + "Send an empty message to \(address) from \(selectedAccount?.email ?? "this account")."
+
+            case .unavailable:
+                unsubscribeMessage = "The unsubscribe header from \(summary.senderEmail) has no usable link."
+            }
+        } catch {
+            unsubscribeMessage = "Unsubscribe failed: \(error.localizedDescription)"
+        }
+    }
+
+    func loadIgnoredUnsubscribes(accountId: Int64) async {
+        sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
     }
 
     // MARK: - History & Undo

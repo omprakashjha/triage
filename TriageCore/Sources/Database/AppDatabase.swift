@@ -230,6 +230,32 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v5_unsubscribe") { db in
+            // RFC 8058: a POST is only safe when the sender advertised one-click
+            // support via List-Unsubscribe-Post. Stored per message so the sender
+            // view can tell a one-click unsubscribe from one needing a browser.
+            try db.alter(table: "emailMetadata") { t in
+                t.add(column: "supportsOneClickUnsubscribe", .boolean)
+                    .notNull()
+                    .defaults(to: false)
+            }
+
+            // Attempts are recorded so a later scan can tell whether the sender
+            // actually stopped — an ignored unsubscribe is otherwise invisible.
+            try db.create(table: "unsubscribeAttempt") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("senderEmail", .text).notNull()
+                t.column("attemptedAt", .datetime).notNull()
+                t.column("method", .text).notNull()
+                t.column("succeeded", .boolean).notNull()
+                t.column("note", .text)
+
+                t.uniqueKey(["accountId", "senderEmail"])
+            }
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -877,6 +903,110 @@ extension AppDatabase {
                 .order(EmailMetadata.Columns.date.desc)
                 .limit(limit)
                 .fetchAll(db)
+        }
+    }
+}
+
+// MARK: - Unsubscribe
+
+extension AppDatabase {
+    /// The most recent unsubscribe header seen from a sender, with its one-click flag.
+    ///
+    /// Uses the newest message because senders rotate their unsubscribe URLs — an old
+    /// header may point at a link that has already expired.
+    public func latestUnsubscribeInfo(
+        accountId: Int64,
+        senderEmail: String
+    ) async throws -> (header: String, supportsOneClick: Bool)? {
+        try await dbWriter.read { db in
+            guard let row = try Row.fetchOne(db, sql: """
+                SELECT listUnsubscribeHeader, supportsOneClickUnsubscribe
+                FROM emailMetadata
+                WHERE accountId = ? AND LOWER(senderEmail) = ?
+                  AND listUnsubscribeHeader IS NOT NULL
+                ORDER BY date DESC
+                LIMIT 1
+                """,
+                arguments: [accountId, senderEmail.lowercased()]
+            ) else { return nil }
+
+            guard let header: String = row["listUnsubscribeHeader"] else { return nil }
+            let oneClick = (row["supportsOneClickUnsubscribe"] as Bool?) ?? false
+            return (header: header, supportsOneClick: oneClick)
+        }
+    }
+
+    public func recordUnsubscribeAttempt(
+        _ attempt: UnsubscribeAttempt,
+        accountId: Int64
+    ) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO unsubscribeAttempt
+                        (accountId, senderEmail, attemptedAt, method, succeeded, note)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(accountId, senderEmail) DO UPDATE SET
+                        attemptedAt = excluded.attemptedAt,
+                        method = excluded.method,
+                        succeeded = excluded.succeeded,
+                        note = excluded.note
+                    """,
+                arguments: [
+                    accountId,
+                    attempt.senderEmail.lowercased(),
+                    attempt.attemptedAt,
+                    attempt.method,
+                    attempt.succeeded,
+                    attempt.note
+                ]
+            )
+        }
+    }
+
+    public func fetchUnsubscribeAttempts(accountId: Int64) async throws -> [UnsubscribeAttempt] {
+        try await dbWriter.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT senderEmail, attemptedAt, method, succeeded, note
+                FROM unsubscribeAttempt
+                WHERE accountId = ?
+                ORDER BY attemptedAt DESC
+                """,
+                arguments: [accountId]
+            ).map { row in
+                UnsubscribeAttempt(
+                    senderEmail: row["senderEmail"],
+                    attemptedAt: row["attemptedAt"],
+                    method: row["method"],
+                    succeeded: row["succeeded"],
+                    note: row["note"]
+                )
+            }
+        }
+    }
+
+    /// Senders that kept sending after a successful unsubscribe.
+    ///
+    /// This is the verification step: an unsubscribe that quietly did nothing looks
+    /// identical to one that worked until you check whether mail kept arriving.
+    public func sendersIgnoringUnsubscribe(accountId: Int64) async throws -> [String] {
+        let attempts = try await fetchUnsubscribeAttempts(accountId: accountId)
+        guard !attempts.isEmpty else { return [] }
+
+        return try await dbWriter.read { db in
+            var ignoring: [String] = []
+            for attempt in attempts where attempt.succeeded {
+                let latest = try Date.fetchOne(db, sql: """
+                    SELECT MAX(date) FROM emailMetadata
+                    WHERE accountId = ? AND LOWER(senderEmail) = ?
+                    """,
+                    arguments: [accountId, attempt.senderEmail]
+                )
+                if attempt.wasIgnored(latestMailDate: latest) {
+                    ignoring.append(attempt.senderEmail)
+                }
+            }
+            return ignoring
         }
     }
 }

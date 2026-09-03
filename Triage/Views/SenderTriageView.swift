@@ -279,6 +279,30 @@ struct SenderDecisionSheet: View {
                     .foregroundStyle(.secondary)
             }
 
+            if summary.hasUnsubscribeOption {
+                VStack(alignment: .leading, spacing: 6) {
+                    // Unsubscribing is the only action here that reduces future mail
+                    // rather than tidying past mail, so it gets its own affordance.
+                    Button {
+                        Task {
+                            if let accountId = appState.selectedAccount?.id {
+                                await appState.unsubscribe(from: summary, accountId: accountId)
+                            }
+                        }
+                    } label: {
+                        Label("Unsubscribe from this sender", systemImage: "envelope.badge.shield.half.filled")
+                    }
+                    .buttonStyle(.bordered)
+
+                    if let message = appState.unsubscribeMessage {
+                        Text(message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
             Divider()
 
             Picker("Action", selection: $action) {

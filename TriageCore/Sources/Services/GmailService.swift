@@ -262,6 +262,7 @@ public actor GmailService {
             snippet: message.snippet,
             hasListUnsubscribe: listUnsubscribe != nil,
             listUnsubscribeHeader: listUnsubscribe,
+            supportsOneClickUnsubscribe: message.supportsOneClickUnsubscribe,
             replyTo: message.replyTo,
             labels: message.labelIds,
             isUnread: message.isUnread
