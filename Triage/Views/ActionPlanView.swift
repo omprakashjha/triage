@@ -72,37 +72,46 @@ struct ActionPlanView: View {
     // MARK: - Execute Footer
 
     private var executeFooter: some View {
-        HStack {
-            if let progress = executionProgress {
-                ProgressView(value: progress.progress) {
-                    Text(progress.currentBatch)
-                        .font(.caption)
-                }
-                .progressViewStyle(.linear)
-                .frame(maxWidth: 300)
-
-                Text("\(progress.completedActions)/\(progress.totalActions)")
+        VStack(spacing: 6) {
+            if let error = appState.lastExecutionError {
+                Label(error, systemImage: "exclamationmark.triangle.fill")
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.red)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
 
-            Spacer()
+            HStack {
+                if let progress = appState.executionProgress {
+                    ProgressView(value: progress.progress) {
+                        Text(progress.currentBatch)
+                            .font(.caption)
+                    }
+                    .progressViewStyle(.linear)
+                    .frame(maxWidth: 300)
 
-            if isExecuting {
-                Button("Cancel") {
-                    Task { await appState.cancelExecution() }
+                    Text("\(progress.completedActions)/\(progress.totalActions)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Text("\(totalApproved) emails will be affected")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
 
-                Button("Execute Plan") {
-                    showConfirmation = true
+                Spacer()
+
+                if appState.isExecuting {
+                    Button("Cancel") {
+                        Task { await appState.cancelExecution() }
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Text("\(totalApproved) emails will be affected")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Button("Execute Plan") {
+                        showConfirmation = true
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(totalApproved == 0)
                 }
-                .buttonStyle(.borderedProminent)
-                .disabled(totalApproved == 0)
             }
         }
         .padding()
@@ -139,8 +148,9 @@ struct ActionPlanView: View {
         isExecuting = true
         defer { isExecuting = false }
 
-        // Execution would be wired through AppState → BatchExecutor
-        // For now, this demonstrates the UI flow
+        // Execute the plan as the user actually approved it, not as originally
+        // generated — `items` carries their per-item approval toggles.
+        await appState.executePlan(currentPlan)
     }
 }
 

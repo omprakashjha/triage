@@ -176,6 +176,25 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v3_execution_state") { db in
+            // `actionTaken` was overloaded: it meant both "the user marked this" and
+            // "this was already executed against the provider". With undo in play those
+            // must be distinguishable, otherwise executed mail reappears in the pending
+            // queue and undo cannot tell what it is reversing.
+            //
+            // nil        -> marked, not yet executed (pending)
+            // non-nil    -> executed against the provider at this time
+            try db.alter(table: "emailMetadata") { t in
+                t.add(column: "actionExecutedAt", .datetime)
+            }
+
+            try db.create(
+                index: "idx_emailMetadata_actionExecutedAt",
+                on: "emailMetadata",
+                columns: ["accountId", "actionExecutedAt"]
+            )
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -246,6 +265,7 @@ extension AppDatabase {
         accountId: Int64,
         category: EmailCategory? = nil,
         unreadOnly: Bool = false,
+        includeExecuted: Bool = false,
         limit: Int = 100,
         offset: Int = 0
     ) async throws -> [EmailMetadata] {
@@ -258,6 +278,11 @@ extension AppDatabase {
             }
             if unreadOnly {
                 query = query.filter(EmailMetadata.Columns.isUnread == true)
+            }
+            // Executed mail is retained for undo/history but must not appear in the
+            // working views, or it gets planned and actioned a second time.
+            if !includeExecuted {
+                query = query.filter(EmailMetadata.Columns.actionExecutedAt == nil)
             }
 
             return try query
@@ -280,6 +305,7 @@ extension AppDatabase {
             try EmailMetadata
                 .filter(EmailMetadata.Columns.accountId == accountId)
                 .filter(EmailMetadata.Columns.safetyTier == tier.rawValue)
+                .filter(EmailMetadata.Columns.actionExecutedAt == nil)
                 .order(EmailMetadata.Columns.date.desc)
                 .limit(limit)
                 .fetchAll(db)
@@ -297,11 +323,16 @@ extension AppDatabase {
         }
     }
 
+    /// Emails the user has marked but which have NOT yet been sent to the provider.
+    ///
+    /// Filtering on `actionExecutedAt == nil` is what stops already-executed mail from
+    /// reappearing in the Pending Actions panel and being submitted twice.
     public func fetchMarkedEmails(accountId: Int64) async throws -> [EmailMetadata] {
         try await dbWriter.read { db in
             try EmailMetadata
                 .filter(EmailMetadata.Columns.accountId == accountId)
                 .filter(EmailMetadata.Columns.actionTaken != nil)
+                .filter(EmailMetadata.Columns.actionExecutedAt == nil)
                 .order(EmailMetadata.Columns.date.desc)
                 .fetchAll(db)
         }
@@ -602,12 +633,43 @@ extension AppDatabase {
                 try db.execute(
                     sql: """
                         UPDATE emailMetadata
-                        SET actionTaken = NULL, actionDate = NULL, updatedAt = ?
+                        SET actionTaken = NULL, actionDate = NULL,
+                            actionExecutedAt = NULL, updatedAt = ?
                         WHERE accountId = ? AND messageId IN (\(placeholders))
                         """,
                     arguments: arguments
                 )
             }
+        }
+    }
+
+    /// Record that an action was actually carried out against the provider.
+    ///
+    /// Distinct from ``markEmailsActioned(messageIds:accountId:action:)``, which only
+    /// records the user's intent. Executed mail leaves the working views but is kept
+    /// in the database so the action remains undoable.
+    public func markEmailsExecuted(
+        messageIds: [String],
+        accountId: Int64,
+        action: EmailAction,
+        executedAt: Date = Date()
+    ) async throws {
+        guard !messageIds.isEmpty else { return }
+        let placeholders = messageIds.map { _ in "?" }.joined(separator: ",")
+
+        try await dbWriter.write { db in
+            var arguments: StatementArguments = [
+                action.rawValue, executedAt, executedAt, executedAt, accountId
+            ]
+            for id in messageIds { arguments += [id] }
+            try db.execute(
+                sql: """
+                    UPDATE emailMetadata
+                    SET actionTaken = ?, actionDate = ?, actionExecutedAt = ?, updatedAt = ?
+                    WHERE accountId = ? AND messageId IN (\(placeholders))
+                    """,
+                arguments: arguments
+            )
         }
     }
 
@@ -625,6 +687,23 @@ extension AppDatabase {
                 .order(ActionLog.Columns.executedAt.desc)
                 .limit(limit)
                 .fetchAll(db)
+        }
+    }
+
+    /// Action history for one account, newest first — backs the History tab.
+    public func fetchActionHistory(accountId: Int64, limit: Int = 200) async throws -> [ActionLog] {
+        try await dbWriter.read { db in
+            try ActionLog
+                .filter(ActionLog.Columns.accountId == accountId)
+                .order(ActionLog.Columns.executedAt.desc)
+                .limit(limit)
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchAction(id: Int64) async throws -> ActionLog? {
+        try await dbWriter.read { db in
+            try ActionLog.filter(ActionLog.Columns.id == id).fetchOne(db)
         }
     }
 

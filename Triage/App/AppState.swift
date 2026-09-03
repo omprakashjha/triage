@@ -3,6 +3,16 @@ import TriageCore
 
 @MainActor
 final class AppState: ObservableObject {
+    /// Which surface the detail column shows.
+    ///
+    /// Account selection is a separate axis (the sidebar's `List` selection is typed to
+    /// `EmailAccount`), so the chosen view is tracked here rather than folded into it.
+    enum DetailRoute: Hashable {
+        case overview
+        case history
+    }
+
+    @Published var detailRoute: DetailRoute = .overview
     @Published var accounts: [EmailAccount] = []
     @Published var scanProgress: ScanProgress?
     @Published var isScanning = false
@@ -15,6 +25,10 @@ final class AppState: ObservableObject {
     /// count in the UI is zero too.
     @Published var knownContactCount = 0
     @Published var isRefreshingContacts = false
+    /// Live progress while an action plan runs. Nil when idle.
+    @Published var executionProgress: ExecutionProgress?
+    @Published var actionHistory: [ActionLog] = []
+    @Published var lastExecutionError: String?
 
     private let database: AppDatabase
     private let contactDetector: ContactDetector
@@ -194,6 +208,84 @@ final class AppState: ObservableObject {
         await batchExecutor?.cancel()
     }
 
+    // MARK: - Plan Execution
+
+    /// Execute an approved action plan against the provider, streaming progress.
+    ///
+    /// This is the path that `ActionPlanView` previously left as a stub, so the whole
+    /// generate -> approve -> confirm flow did nothing at all.
+    func executePlan(_ plan: ActionPlan) async {
+        guard let executor = batchExecutor, let account = selectedAccount else {
+            lastExecutionError = "No account connected. Reconnect and rescan before executing."
+            return
+        }
+        guard plan.totalApproved > 0 else {
+            lastExecutionError = "Nothing approved in this plan."
+            return
+        }
+
+        isExecuting = true
+        lastExecutionError = nil
+        defer {
+            isExecuting = false
+            executionProgress = nil
+        }
+
+        do {
+            let stream = await executor.execute(plan: plan, provider: account.provider)
+            for try await progress in stream {
+                executionProgress = progress
+                if case .failed(let message) = progress.status {
+                    lastExecutionError = message
+                }
+            }
+
+            if let accountId = account.id {
+                accountStats = try await database.accountStats(accountId: accountId)
+                await loadActionHistory(accountId: accountId)
+                // The executed mail has left the working set, so the old plan is stale.
+                actionPlan = nil
+            }
+        } catch {
+            lastExecutionError = error.localizedDescription
+        }
+    }
+
+    // MARK: - History & Undo
+
+    func loadActionHistory(accountId: Int64) async {
+        do {
+            actionHistory = try await database.fetchActionHistory(accountId: accountId)
+        } catch {
+            print("Failed to load action history: \(error)")
+        }
+    }
+
+    /// Reverse a previously-executed batch.
+    ///
+    /// Note the provider comes from the selected account rather than a default — a
+    /// Yahoo action reversed through the Gmail branch would fail or hit the wrong API.
+    func undo(action: ActionLog) async {
+        guard let executor = batchExecutor, let account = selectedAccount, let actionId = action.id else {
+            lastExecutionError = "No account connected — cannot undo."
+            return
+        }
+
+        isExecuting = true
+        lastExecutionError = nil
+        defer { isExecuting = false }
+
+        do {
+            try await executor.undoAction(actionId: actionId, provider: account.provider)
+            if let accountId = account.id {
+                accountStats = try await database.accountStats(accountId: accountId)
+                await loadActionHistory(accountId: accountId)
+            }
+        } catch {
+            lastExecutionError = "Undo failed: \(error.localizedDescription)"
+        }
+    }
+
     func fetchEmails(accountId: Int64, category: EmailCategory) async throws -> [EmailMetadata] {
         try await database.fetchEmails(accountId: accountId, category: category, limit: 500)
     }
@@ -295,18 +387,19 @@ final class AppState: ObservableObject {
         )
 
         let stream = await executor.execute(plan: plan, provider: account.provider)
-        for try await _ in stream {
-            // Progress updates
+        for try await progress in stream {
+            executionProgress = progress
         }
+        executionProgress = nil
 
-        // Remove deleted emails from local database
-        let deletedIds = toDelete.map(\.messageId)
-        if !deletedIds.isEmpty {
-            try await database.removeEmails(messageIds: deletedIds, accountId: account.id!)
+        // Deleted rows are deliberately NOT removed from the local database.
+        // BatchExecutor marks them executed instead, which keeps them out of the
+        // working views while leaving the batch undoable — deleting the rows made
+        // undo unable to restore local state.
+        if let accountId = account.id {
+            accountStats = try await database.accountStats(accountId: accountId)
+            await loadActionHistory(accountId: accountId)
         }
-
-        // Refresh stats
-        accountStats = try await database.accountStats(accountId: account.id!)
     }
 
     func refreshStats(accountId: Int64) async throws -> AccountStats {

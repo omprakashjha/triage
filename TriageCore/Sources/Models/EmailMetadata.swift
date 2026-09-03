@@ -33,6 +33,17 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
     // Action tracking
     public var actionTaken: EmailAction?
     public var actionDate: Date?
+    /// When this action was actually carried out against the provider.
+    /// `nil` while the action is only marked locally (pending), set once executed.
+    /// Undo clears it along with `actionTaken`.
+    public var actionExecutedAt: Date?
+
+    /// Marked by the user but not yet sent to the provider.
+    public var isPendingAction: Bool { actionTaken != nil && actionExecutedAt == nil }
+
+    /// Already carried out against the provider — excluded from the working views
+    /// but retained so the action stays undoable.
+    public var isExecuted: Bool { actionExecutedAt != nil }
 
     public var createdAt: Date
     public var updatedAt: Date
@@ -58,6 +69,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         categoryReason: String? = nil,
         actionTaken: EmailAction? = nil,
         actionDate: Date? = nil,
+        actionExecutedAt: Date? = nil,
         createdAt: Date = Date(),
         updatedAt: Date = Date()
     ) {
@@ -81,6 +93,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         self.categoryReason = categoryReason
         self.actionTaken = actionTaken
         self.actionDate = actionDate
+        self.actionExecutedAt = actionExecutedAt
         self.createdAt = createdAt
         self.updatedAt = updatedAt
     }
@@ -92,7 +105,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         case hasListUnsubscribe, listUnsubscribeHeader, replyTo
         case labels, isUnread
         case category, safetyTier, categoryConfidence, categoryReason
-        case actionTaken, actionDate
+        case actionTaken, actionDate, actionExecutedAt
         case createdAt, updatedAt
     }
 
