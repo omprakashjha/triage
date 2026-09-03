@@ -273,6 +273,28 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v7_sender_verdicts") { db in
+            // Model verdicts, keyed by model AND prompt version so that changing either
+            // re-classifies rather than silently reusing verdicts produced by something
+            // else. A rescan then costs nothing for senders already judged.
+            try db.create(table: "senderVerdict") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("senderEmail", .text).notNull()
+                t.column("modelId", .text).notNull()
+                t.column("promptVersion", .text).notNull()
+                t.column("category", .text).notNull()
+                t.column("mustKeep", .boolean).notNull()
+                t.column("isRealPerson", .boolean).notNull()
+                t.column("confidence", .double).notNull()
+                t.column("reason", .text).notNull()
+                t.column("createdAt", .datetime).notNull()
+
+                t.uniqueKey(["accountId", "senderEmail", "modelId", "promptVersion"])
+            }
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -1119,6 +1141,126 @@ extension AppDatabase {
                 )
             }
         )
+    }
+}
+
+// MARK: - Sender Verdict Cache
+
+extension AppDatabase: SenderVerdictCaching {
+    public func cachedVerdicts(
+        accountId: Int64,
+        senderEmails: [String],
+        modelId: String,
+        promptVersion: String
+    ) async throws -> [String: SenderVerdict] {
+        guard !senderEmails.isEmpty else { return [:] }
+        let normalized = senderEmails.map { $0.lowercased() }
+
+        return try await dbWriter.read { db in
+            let placeholders = normalized.map { _ in "?" }.joined(separator: ",")
+            var arguments: [DatabaseValueConvertible] = [accountId, modelId, promptVersion]
+            arguments.append(contentsOf: normalized)
+
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT senderEmail, category, mustKeep, isRealPerson, confidence, reason
+                FROM senderVerdict
+                WHERE accountId = ? AND modelId = ? AND promptVersion = ?
+                  AND senderEmail IN (\(placeholders))
+                """,
+                arguments: StatementArguments(arguments)
+            )
+
+            var verdicts: [String: SenderVerdict] = [:]
+            for row in rows {
+                guard let raw: String = row["category"],
+                      let category = EmailCategory(rawValue: raw) else { continue }
+                let sender: String = row["senderEmail"]
+                verdicts[sender.lowercased()] = SenderVerdict(
+                    senderEmail: sender,
+                    category: category,
+                    mustKeep: row["mustKeep"],
+                    isRealPerson: row["isRealPerson"],
+                    confidence: row["confidence"],
+                    reason: row["reason"]
+                )
+            }
+            return verdicts
+        }
+    }
+
+    public func storeVerdicts(
+        _ verdicts: [SenderVerdict],
+        accountId: Int64,
+        modelId: String,
+        promptVersion: String
+    ) async throws {
+        guard !verdicts.isEmpty else { return }
+        try await dbWriter.write { db in
+            for verdict in verdicts {
+                try db.execute(
+                    sql: """
+                        INSERT INTO senderVerdict
+                            (accountId, senderEmail, modelId, promptVersion, category,
+                             mustKeep, isRealPerson, confidence, reason, createdAt)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(accountId, senderEmail, modelId, promptVersion)
+                        DO UPDATE SET
+                            category = excluded.category,
+                            mustKeep = excluded.mustKeep,
+                            isRealPerson = excluded.isRealPerson,
+                            confidence = excluded.confidence,
+                            reason = excluded.reason,
+                            createdAt = excluded.createdAt
+                        """,
+                    arguments: [
+                        accountId,
+                        verdict.senderEmail.lowercased(),
+                        modelId,
+                        promptVersion,
+                        verdict.category.rawValue,
+                        verdict.mustKeep,
+                        verdict.isRealPerson,
+                        verdict.confidence,
+                        verdict.reason,
+                        Date()
+                    ]
+                )
+            }
+        }
+    }
+
+    /// Recent subject lines from a sender, for building a classification request.
+    public func sampleSubjects(
+        accountId: Int64,
+        senderEmail: String,
+        limit: Int = 5
+    ) async throws -> [String] {
+        try await dbWriter.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT subject FROM emailMetadata
+                WHERE accountId = ? AND LOWER(senderEmail) = ?
+                ORDER BY date DESC
+                LIMIT ?
+                """,
+                arguments: [accountId, senderEmail.lowercased(), limit]
+            )
+        }
+    }
+
+    /// How many senders currently have a cached verdict for this model and prompt.
+    public func cachedVerdictCount(
+        accountId: Int64,
+        modelId: String,
+        promptVersion: String
+    ) async throws -> Int {
+        try await dbWriter.read { db in
+            try Int.fetchOne(db, sql: """
+                SELECT COUNT(*) FROM senderVerdict
+                WHERE accountId = ? AND modelId = ? AND promptVersion = ?
+                """,
+                arguments: [accountId, modelId, promptVersion]
+            ) ?? 0
+        }
     }
 }
 
