@@ -1,0 +1,37 @@
+# Xcode
+*.xcodeproj/project.xcworkspace/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+build/
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+!default.pbxuser
+!default.mode1v3
+!default.mode2v3
+!default.perspectivev3
+
+# SPM
+.build/
+.swiftpm/
+Package.resolved
+
+# macOS
+.DS_Store
+*.swp
+*.lock
+profile
+
+# Secrets (never commit)
+credentials.json
+GoogleService-Info.plist
+*.p12
+*.key
+
+# App config with secrets
+# NOTE: pattern must match Triage/Config/Secrets.swift, not just a root-level Config/
+**/Config/Secrets.swift
+Secrets.swift
