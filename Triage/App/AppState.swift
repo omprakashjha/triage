@@ -9,10 +9,18 @@ final class AppState: ObservableObject {
     /// `EmailAccount`), so the chosen view is tracked here rather than folded into it.
     enum DetailRoute: Hashable {
         case overview
+        case senders
         case history
+        case settings
     }
 
     @Published var detailRoute: DetailRoute = .overview
+    @Published var senderSummaries: [SenderSummary] = []
+    @Published var senderRules: [SenderRule] = []
+    @Published var settings: AccountSettings?
+    @Published var isLoadingSenders = false
+    /// Count of emails auto-marked by standing sender rules on the last scan.
+    @Published var lastRuleMatchCount = 0
     @Published var accounts: [EmailAccount] = []
     @Published var scanProgress: ScanProgress?
     @Published var isScanning = false
@@ -78,10 +86,14 @@ final class AppState: ObservableObject {
                 return
             }
 
+            await loadSettings(accountId: accountId)
+            let scope = settings?.scanScope ?? .unreadOnly
+
             let stream = await service.fetchAllMetadata(
                 accountId: accountId,
                 lastHistoryId: account.lastHistoryId,
-                incremental: account.lastHistoryId != nil
+                incremental: account.lastHistoryId != nil,
+                scope: scope
             )
 
             for try await progress in stream {
@@ -97,6 +109,10 @@ final class AppState: ObservableObject {
 
             // Auto-categorize after scan
             await categorizeEmails(accountId: accountId)
+
+            // Standing sender rules cover new arrivals without asking again.
+            await applySenderRules(accountId: accountId)
+            await loadSenderSummaries(accountId: accountId)
         } catch {
             scanProgress?.status = .failed(error.localizedDescription)
         }
@@ -197,7 +213,10 @@ final class AppState: ObservableObject {
         guard let account = selectedAccount, let accountId = account.id else { return }
         do {
             let emails = try await database.fetchEmails(accountId: accountId, limit: 50000, offset: 0)
-            let planner = ActionPlanner()
+            // Use the user's saved rules rather than the hardcoded defaults —
+            // ActionRules was Codable from the start but never persisted or edited.
+            if settings == nil { await loadSettings(accountId: accountId) }
+            let planner = ActionPlanner(rules: settings?.actionRules ?? .default)
             actionPlan = planner.generatePlan(emails: emails, accountId: accountId)
         } catch {
             print("Plan generation failed: \(error)")
@@ -249,6 +268,163 @@ final class AppState: ObservableObject {
         } catch {
             lastExecutionError = error.localizedDescription
         }
+    }
+
+    // MARK: - Sender Triage
+
+    func loadSenderSummaries(accountId: Int64) async {
+        isLoadingSenders = true
+        defer { isLoadingSenders = false }
+        do {
+            senderSummaries = try await database.senderSummaries(accountId: accountId)
+            senderRules = try await database.fetchSenderRules(accountId: accountId)
+        } catch {
+            print("Failed to load sender summaries: \(error)")
+        }
+    }
+
+    /// Apply a decision to every message from a sender, optionally persisting it as a
+    /// standing rule so future mail is handled without asking again.
+    ///
+    /// Marks rather than executes: nothing reaches the provider until the user presses
+    /// Execute, so a mis-click on a 400-message sender is recoverable by clearing it.
+    func decideSender(
+        _ summary: SenderSummary,
+        action: EmailAction,
+        accountId: Int64,
+        persistAsRule: Bool,
+        ruleScope: RuleScope = .address,
+        keepNewest: Int = 0
+    ) async {
+        guard !summary.isProtected else {
+            lastExecutionError = "\(summary.senderEmail) is a known contact — protected mail is never bulk-actioned."
+            return
+        }
+
+        do {
+            let ids: [String]
+            if keepNewest > 0 {
+                ids = try await database.messageIds(
+                    accountId: accountId,
+                    senderEmail: summary.senderEmail,
+                    keepNewest: keepNewest
+                )
+            } else {
+                ids = try await database.messageIds(
+                    accountId: accountId,
+                    senderEmail: summary.senderEmail
+                )
+            }
+
+            try await database.markEmailsActioned(
+                messageIds: ids,
+                accountId: accountId,
+                action: action
+            )
+
+            if persistAsRule {
+                let pattern = ruleScope == .domain
+                    ? EmailHeaderParser.extractDomain(summary.senderEmail)
+                    : summary.senderEmail
+                try await database.saveSenderRule(
+                    SenderRule(
+                        accountId: accountId,
+                        pattern: pattern,
+                        scope: ruleScope,
+                        action: action
+                    )
+                )
+            }
+
+            await loadSenderSummaries(accountId: accountId)
+            accountStats = try await database.accountStats(accountId: accountId)
+        } catch {
+            lastExecutionError = "Failed to apply decision: \(error.localizedDescription)"
+        }
+    }
+
+    /// Pin a sender as a contact so their mail is protected from every rule and plan.
+    func protectSender(_ summary: SenderSummary, accountId: Int64) async {
+        await pinContact(email: summary.senderEmail, accountId: accountId)
+        await loadSenderSummaries(accountId: accountId)
+    }
+
+    // MARK: - Standing Rules
+
+    /// Re-apply every enabled sender rule to unmarked mail.
+    ///
+    /// Runs after each scan so standing decisions cover new arrivals automatically.
+    /// Protected mail is excluded at the query level, so a rule can never touch a
+    /// contact's messages even if a rule pattern would otherwise match.
+    @discardableResult
+    func applySenderRules(accountId: Int64) async -> Int {
+        do {
+            let rules = try await database.fetchEnabledSenderRules(accountId: accountId)
+            guard !rules.isEmpty else {
+                lastRuleMatchCount = 0
+                return 0
+            }
+
+            let candidates = try await database.fetchUnmarkedActionableEmails(accountId: accountId)
+            var byAction: [EmailAction: [String]] = [:]
+            for email in candidates {
+                // First matching rule wins; rules are ordered newest-first.
+                if let rule = rules.first(where: { $0.matches(email) }) {
+                    byAction[rule.action, default: []].append(email.messageId)
+                }
+            }
+
+            for (action, ids) in byAction {
+                try await database.markEmailsActioned(
+                    messageIds: ids,
+                    accountId: accountId,
+                    action: action
+                )
+            }
+
+            let total = byAction.values.reduce(0) { $0 + $1.count }
+            lastRuleMatchCount = total
+            return total
+        } catch {
+            print("Failed to apply sender rules: \(error)")
+            return 0
+        }
+    }
+
+    func loadSenderRules(accountId: Int64) async {
+        senderRules = (try? await database.fetchSenderRules(accountId: accountId)) ?? []
+    }
+
+    func deleteSenderRule(_ rule: SenderRule, accountId: Int64) async {
+        guard let id = rule.id else { return }
+        try? await database.deleteSenderRule(id: id)
+        await loadSenderRules(accountId: accountId)
+    }
+
+    func toggleSenderRule(_ rule: SenderRule, accountId: Int64) async {
+        guard let id = rule.id else { return }
+        try? await database.setSenderRuleEnabled(id: id, isEnabled: !rule.isEnabled)
+        await loadSenderRules(accountId: accountId)
+    }
+
+    // MARK: - Settings
+
+    func loadSettings(accountId: Int64) async {
+        settings = try? await database.accountSettings(accountId: accountId)
+    }
+
+    func updateScanScope(_ scope: ScanScope, accountId: Int64) async {
+        var updated = settings ?? AccountSettings(accountId: accountId)
+        updated.scanScope = scope
+        settings = updated
+        try? await database.saveAccountSettings(updated)
+    }
+
+    func updateActionRules(_ rules: ActionRules, accountId: Int64) async {
+        var updated = settings ?? AccountSettings(accountId: accountId)
+        updated.actionRules = rules
+        settings = updated
+        try? await database.saveAccountSettings(updated)
     }
 
     // MARK: - History & Undo

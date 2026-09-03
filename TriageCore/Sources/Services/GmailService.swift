@@ -18,7 +18,8 @@ public actor GmailService {
     public func fetchAllMetadata(
         accountId: Int64,
         lastHistoryId: String? = nil,
-        incremental: Bool = true
+        incremental: Bool = true,
+        scope: ScanScope = .unreadOnly
     ) -> AsyncThrowingStream<ScanProgress, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -27,11 +28,13 @@ public actor GmailService {
                         try await self.performIncrementalSync(
                             accountId: accountId,
                             historyId: historyId,
+                            scope: scope,
                             continuation: continuation
                         )
                     } else {
                         try await self.performFullSync(
                             accountId: accountId,
+                            scope: scope,
                             continuation: continuation
                         )
                     }
@@ -51,12 +54,13 @@ public actor GmailService {
 
     private func performFullSync(
         accountId: Int64,
+        scope: ScanScope,
         continuation: AsyncThrowingStream<ScanProgress, Error>.Continuation
     ) async throws {
         // Step 1: Get all message IDs
         continuation.yield(ScanProgress(total: 0, fetched: 0, status: .fetchingList))
 
-        let messageIds = try await client.listAllMessageIds(query: "is:unread")
+        let messageIds = try await client.listAllMessageIds(query: scope.gmailQuery)
         let total = messageIds.count
 
         if total == 0 {
@@ -102,6 +106,7 @@ public actor GmailService {
     private func performIncrementalSync(
         accountId: Int64,
         historyId: String,
+        scope: ScanScope,
         continuation: AsyncThrowingStream<ScanProgress, Error>.Continuation
     ) async throws {
         continuation.yield(ScanProgress(total: 0, fetched: 0, status: .fetchingList))
@@ -153,8 +158,16 @@ public actor GmailService {
             let batchStream = client.batchGetMessages(ids: ids)
 
             for try await batch in batchStream {
+                // The History API returns every added message regardless of the query
+                // used for the full sync, so the scope filter has to be re-applied here
+                // or the local database drifts out of agreement with itself.
                 let emails = batch.compactMap { message -> EmailMetadata? in
-                    self.convertToMetadata(message: message, accountId: accountId)
+                    guard scope.includes(
+                        labelIds: message.labelIds,
+                        isUnread: message.isUnread,
+                        date: message.parsedDate ?? Date()
+                    ) else { return nil }
+                    return self.convertToMetadata(message: message, accountId: accountId)
                 }
 
                 try await database.batchUpsertEmails(emails)
@@ -179,7 +192,7 @@ public actor GmailService {
         } catch let error as APIError {
             // If historyId is too old (404), fall back to full sync
             if case .httpError(statusCode: 404, _) = error {
-                try await performFullSync(accountId: accountId, continuation: continuation)
+                try await performFullSync(accountId: accountId, scope: scope, continuation: continuation)
             } else {
                 throw error
             }

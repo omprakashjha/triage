@@ -195,6 +195,41 @@ public final class AppDatabase: Sendable {
             )
         }
 
+        migrator.registerMigration("v4_sender_rules") { db in
+            // Standing per-sender decisions, re-applied on every scan. This is what
+            // makes a triage decision durable instead of a one-off sweep.
+            try db.create(table: "senderRule") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("pattern", .text).notNull()
+                t.column("scope", .text).notNull()
+                t.column("action", .text).notNull()
+                t.column("minAgeDays", .integer)
+                t.column("isEnabled", .boolean).notNull().defaults(to: true)
+                t.column("createdAt", .datetime).notNull()
+
+                t.uniqueKey(["accountId", "pattern", "scope"])
+            }
+
+            try db.create(
+                index: "idx_senderRule_accountId",
+                on: "senderRule",
+                columns: ["accountId", "isEnabled"]
+            )
+
+            // Persisted category-level action rules (ActionRules), stored as JSON so
+            // the struct can gain fields without another migration. Previously
+            // ActionRules was Codable but always the hardcoded .default.
+            try db.create(table: "accountSettings") { t in
+                t.column("accountId", .integer).notNull().primaryKey()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("actionRulesJSON", .text)
+                t.column("scanScope", .text)
+                t.column("updatedAt", .datetime).notNull()
+            }
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -587,6 +622,259 @@ extension AppDatabase {
                     EmailMetadata.Columns.categoryConfidence.ascNullsLast,
                     EmailMetadata.Columns.date.desc
                 )
+                .limit(limit)
+                .fetchAll(db)
+        }
+    }
+}
+
+// MARK: - Sender Aggregation
+
+extension AppDatabase {
+    /// One row per unique sender, aggregated in SQL.
+    ///
+    /// Deliberately not built by loading every email into memory: a large mailbox has
+    /// tens of thousands of messages but only a few hundred senders, and the whole
+    /// point of the sender view is that it stays cheap on a big inbox.
+    public func senderSummaries(
+        accountId: Int64,
+        limit: Int = 1000
+    ) async throws -> [SenderSummary] {
+        let contacts = try await knownContactEmails(accountId: accountId)
+
+        return try await dbWriter.read { db in
+            // Aggregates. Executed mail is excluded so acted-on senders drop off the list.
+            let rows = try Row.fetchAll(db, sql: """
+                SELECT
+                    e.senderEmail AS senderEmail,
+                    (
+                        SELECT e2.sender FROM emailMetadata e2
+                        WHERE e2.accountId = e.accountId
+                          AND e2.senderEmail = e.senderEmail
+                        ORDER BY e2.date DESC LIMIT 1
+                    ) AS displayName,
+                    COUNT(*) AS totalEmails,
+                    SUM(CASE WHEN e.isUnread THEN 1 ELSE 0 END) AS unreadEmails,
+                    MIN(e.date) AS firstSeen,
+                    MAX(e.date) AS lastSeen,
+                    MAX(CASE WHEN e.hasListUnsubscribe THEN 1 ELSE 0 END) AS hasUnsubscribe
+                FROM emailMetadata e
+                WHERE e.accountId = ? AND e.actionExecutedAt IS NULL
+                GROUP BY e.senderEmail
+                ORDER BY totalEmails DESC
+                LIMIT ?
+                """,
+                arguments: [accountId, limit]
+            )
+
+            // Per-sender category and tier distribution, folded in Swift.
+            let breakdown = try Row.fetchAll(db, sql: """
+                SELECT senderEmail, category, safetyTier, COUNT(*) AS count
+                FROM emailMetadata
+                WHERE accountId = ? AND actionExecutedAt IS NULL
+                GROUP BY senderEmail, category, safetyTier
+                """,
+                arguments: [accountId]
+            )
+
+            var categoryCounts: [String: [EmailCategory: Int]] = [:]
+            var tiers: [String: Set<SafetyTier>] = [:]
+            for row in breakdown {
+                let sender: String = row["senderEmail"]
+                let count: Int = row["count"] ?? 0
+                if let raw: String = row["category"], let category = EmailCategory(rawValue: raw) {
+                    categoryCounts[sender, default: [:]][category, default: 0] += count
+                }
+                if let raw: String = row["safetyTier"], let tier = SafetyTier(rawValue: raw) {
+                    tiers[sender, default: []].insert(tier)
+                }
+            }
+
+            return rows.map { row in
+                let sender: String = row["senderEmail"]
+                let dominant = categoryCounts[sender]?.max(by: { $0.value < $1.value })?.key
+                return SenderSummary(
+                    senderEmail: sender,
+                    displayName: row["displayName"] ?? sender,
+                    totalEmails: row["totalEmails"] ?? 0,
+                    unreadEmails: row["unreadEmails"] ?? 0,
+                    firstSeen: row["firstSeen"] ?? Date(),
+                    lastSeen: row["lastSeen"] ?? Date(),
+                    hasUnsubscribeOption: (row["hasUnsubscribe"] as Int? ?? 0) > 0,
+                    dominantCategory: dominant,
+                    strictestTier: Self.strictestTier(in: tiers[sender] ?? []),
+                    isKnownContact: contacts.contains(sender.lowercased())
+                )
+            }
+        }
+    }
+
+    /// Protected outranks review, which outranks safe — so a sender holding any
+    /// protected mail is never shown as bulk-actionable.
+    static func strictestTier(in tiers: Set<SafetyTier>) -> SafetyTier? {
+        if tiers.contains(.protected_) { return .protected_ }
+        if tiers.contains(.review) { return .review }
+        if tiers.contains(.safe) { return .safe }
+        return nil
+    }
+
+    /// Every unexecuted message id from a sender, for bulk marking.
+    public func messageIds(accountId: Int64, senderEmail: String) async throws -> [String] {
+        try await dbWriter.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT messageId FROM emailMetadata
+                WHERE accountId = ? AND LOWER(senderEmail) = ? AND actionExecutedAt IS NULL
+                """,
+                arguments: [accountId, senderEmail.lowercased()]
+            )
+        }
+    }
+
+    /// Message ids from a sender, keeping the newest `keepNewest` untouched.
+    /// Backs "keep the last 3, delete the rest".
+    public func messageIds(
+        accountId: Int64,
+        senderEmail: String,
+        keepNewest: Int
+    ) async throws -> [String] {
+        try await dbWriter.read { db in
+            try String.fetchAll(db, sql: """
+                SELECT messageId FROM emailMetadata
+                WHERE accountId = ? AND LOWER(senderEmail) = ? AND actionExecutedAt IS NULL
+                ORDER BY date DESC
+                LIMIT -1 OFFSET ?
+                """,
+                arguments: [accountId, senderEmail.lowercased(), keepNewest]
+            )
+        }
+    }
+}
+
+// MARK: - Sender Rules
+
+extension AppDatabase {
+    public func fetchSenderRules(accountId: Int64) async throws -> [SenderRule] {
+        try await dbWriter.read { db in
+            try SenderRule
+                .filter(SenderRule.Columns.accountId == accountId)
+                .order(SenderRule.Columns.createdAt.desc)
+                .fetchAll(db)
+        }
+    }
+
+    public func fetchEnabledSenderRules(accountId: Int64) async throws -> [SenderRule] {
+        try await dbWriter.read { db in
+            try SenderRule
+                .filter(SenderRule.Columns.accountId == accountId)
+                .filter(SenderRule.Columns.isEnabled == true)
+                .fetchAll(db)
+        }
+    }
+
+    /// Upsert a rule. Re-deciding a sender replaces the previous decision rather
+    /// than stacking a second conflicting rule on top of it.
+    public func saveSenderRule(_ rule: SenderRule) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO senderRule (accountId, pattern, scope, action, minAgeDays, isEnabled, createdAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(accountId, pattern, scope) DO UPDATE SET
+                        action = excluded.action,
+                        minAgeDays = excluded.minAgeDays,
+                        isEnabled = excluded.isEnabled
+                    """,
+                arguments: [
+                    rule.accountId,
+                    rule.pattern.lowercased(),
+                    rule.scope.rawValue,
+                    rule.action.rawValue,
+                    rule.minAgeDays,
+                    rule.isEnabled,
+                    rule.createdAt
+                ]
+            )
+        }
+    }
+
+    public func deleteSenderRule(id: Int64) async throws {
+        try await dbWriter.write { db in
+            try db.execute(sql: "DELETE FROM senderRule WHERE id = ?", arguments: [id])
+        }
+    }
+
+    public func setSenderRuleEnabled(id: Int64, isEnabled: Bool) async throws {
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: "UPDATE senderRule SET isEnabled = ? WHERE id = ?",
+                arguments: [isEnabled, id]
+            )
+        }
+    }
+}
+
+// MARK: - Account Settings
+
+extension AppDatabase {
+    public func accountSettings(accountId: Int64) async throws -> AccountSettings {
+        try await dbWriter.read { db in
+            guard let row = try Row.fetchOne(
+                db,
+                sql: "SELECT actionRulesJSON, scanScope FROM accountSettings WHERE accountId = ?",
+                arguments: [accountId]
+            ) else {
+                return AccountSettings(accountId: accountId)
+            }
+
+            var rules = ActionRules.default
+            if let json: String = row["actionRulesJSON"],
+               let data = json.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(ActionRules.self, from: data) {
+                rules = decoded
+            }
+
+            let scope = (row["scanScope"] as String?)
+                .flatMap(ScanScope.init(rawValue:)) ?? .unreadOnly
+
+            return AccountSettings(accountId: accountId, actionRules: rules, scanScope: scope)
+        }
+    }
+
+    public func saveAccountSettings(_ settings: AccountSettings) async throws {
+        let json = String(
+            data: try JSONEncoder().encode(settings.actionRules),
+            encoding: .utf8
+        )
+        try await dbWriter.write { db in
+            try db.execute(
+                sql: """
+                    INSERT INTO accountSettings (accountId, actionRulesJSON, scanScope, updatedAt)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(accountId) DO UPDATE SET
+                        actionRulesJSON = excluded.actionRulesJSON,
+                        scanScope = excluded.scanScope,
+                        updatedAt = excluded.updatedAt
+                    """,
+                arguments: [settings.accountId, json, settings.scanScope.rawValue, Date()]
+            )
+        }
+    }
+
+    /// Emails eligible for automatic rule application.
+    ///
+    /// Excludes anything already marked or executed, and excludes the protected tier
+    /// outright — a sender rule must never be able to action a contact's mail.
+    public func fetchUnmarkedActionableEmails(
+        accountId: Int64,
+        limit: Int = 50000
+    ) async throws -> [EmailMetadata] {
+        try await dbWriter.read { db in
+            try EmailMetadata
+                .filter(EmailMetadata.Columns.accountId == accountId)
+                .filter(EmailMetadata.Columns.actionTaken == nil)
+                .filter(EmailMetadata.Columns.actionExecutedAt == nil)
+                .filter(EmailMetadata.Columns.safetyTier != SafetyTier.protected_.rawValue)
+                .order(EmailMetadata.Columns.date.desc)
                 .limit(limit)
                 .fetchAll(db)
         }

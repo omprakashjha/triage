@@ -17,8 +17,12 @@ struct ContentView: View {
                 switch appState.detailRoute {
                 case .overview:
                     InboxOverviewView()
+                case .senders:
+                    SenderTriageView()
                 case .history:
                     HistoryView()
+                case .settings:
+                    SettingsView()
                 }
             }
         }
@@ -57,9 +61,19 @@ struct SidebarView: View {
                     route: .overview
                 )
                 SidebarRouteRow(
+                    title: "Senders",
+                    systemImage: "person.2.badge.gearshape",
+                    route: .senders
+                )
+                SidebarRouteRow(
                     title: "History",
                     systemImage: "clock.arrow.circlepath",
                     route: .history
+                )
+                SidebarRouteRow(
+                    title: "Settings",
+                    systemImage: "gearshape",
+                    route: .settings
                 )
             }
 
