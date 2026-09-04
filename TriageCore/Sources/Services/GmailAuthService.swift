@@ -48,7 +48,8 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
         let code = try extractAuthCode(from: callbackURL, expectedState: state)
         let tokens = try await exchangeCodeForTokens(code: code, codeVerifier: codeVerifier)
 
-        try saveTokens(tokens)
+        // Initial sign-in must always write: there is nothing stored yet.
+        try saveTokens(tokens, forcePersist: true)
         return tokens
     }
 
@@ -249,12 +250,27 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
     private static let legacyRefreshTokenKey = "gmail_refresh_token"
     private static let legacyExpiresAtKey = "gmail_expires_at"
 
-    private func saveTokens(_ tokens: OAuthTokens) throws {
-        let data = try JSONEncoder().encode(tokens)
-        try keychain.set(data, key: Self.tokensKey)
+    /// Update the tokens, persisting only when the durable half actually changed.
+    ///
+    /// The access token expires in about an hour and is re-derivable from the refresh
+    /// token, so writing it back to the Keychain after every refresh costs one
+    /// authorisation — a password prompt — and buys nothing. The refresh token is the
+    /// only part worth storing, and it rarely changes.
+    ///
+    /// `forcePersist` is for the two cases where we must write regardless: the initial
+    /// sign-in, and the migration off the legacy layout.
+    private func saveTokens(_ tokens: OAuthTokens, forcePersist: Bool = false) throws {
         cacheLock.lock()
+        let previousRefresh = cachedTokens?.refreshToken
         cachedTokens = tokens
         cacheLock.unlock()
+
+        // No cache means we cannot know what is stored, so write to be safe.
+        let refreshTokenChanged = previousRefresh == nil || previousRefresh != tokens.refreshToken
+        guard forcePersist || refreshTokenChanged else { return }
+
+        let data = try JSONEncoder().encode(tokens)
+        try keychain.set(data, key: Self.tokensKey)
     }
 
     /// Load tokens, preferring the in-process cache.
@@ -299,7 +315,7 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
         )
 
         // Write the combined item first, so a failure here cannot lose the tokens.
-        try? saveTokens(tokens)
+        try? saveTokens(tokens, forcePersist: true)
         try? keychain.remove(Self.legacyAccessTokenKey)
         try? keychain.remove(Self.legacyRefreshTokenKey)
         try? keychain.remove(Self.legacyExpiresAtKey)
