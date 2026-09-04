@@ -46,6 +46,9 @@ final class AppState: ObservableObject {
     /// count in the UI is zero too.
     @Published var knownContactCount = 0
     @Published var isRefreshingContacts = false
+    /// Contact detection failing is a narrower problem than the scan failing, and is
+    /// reported separately so the two are not confused.
+    @Published var contactDetectionWarning: String?
     /// Live progress while an action plan runs. Nil when idle.
     @Published var executionProgress: ExecutionProgress?
     @Published var actionHistory: [ActionLog] = []
@@ -82,6 +85,7 @@ final class AppState: ObservableObject {
     func startGmailScan(for account: EmailAccount) async {
         guard !isScanning else { return }
         isScanning = true
+        contactDetectionWarning = nil
         scanProgress = ScanProgress(total: 0, fetched: 0, status: .connecting)
 
         defer { isScanning = false }
@@ -157,12 +161,16 @@ final class AppState: ObservableObject {
             knownContactCount = contacts.count
         } catch {
             // Fall back to whatever was persisted previously rather than an empty set.
+            //
+            // Reported through a SEPARATE channel, not scanProgress.status: marking the
+            // scan itself failed here would claim the mail fetch broke when it in fact
+            // succeeded, and the distinction matters because the consequence is narrow —
+            // the protected tier is weaker than it should be, not that nothing scanned.
             let fallback = (try? await contactDetector.loadPersistedContacts(accountId: accountId)) ?? []
             knownContactCount = fallback.count
-            scanProgress?.status = .failed(
-                "Contact detection failed (\(error.localizedDescription)). "
-                + "Using \(fallback.count) previously-saved contacts — review the plan carefully."
-            )
+            contactDetectionWarning = "Contact detection failed (\(error.localizedDescription)). "
+                + "Using \(fallback.count) previously-saved contacts — review the plan carefully, "
+                + "because fewer contacts means less mail is protected."
         }
     }
 

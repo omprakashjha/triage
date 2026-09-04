@@ -14,17 +14,31 @@ struct ContentView: View {
             } else if appState.accounts.isEmpty {
                 WelcomeView()
             } else {
-                switch appState.detailRoute {
-                case .overview:
-                    InboxOverviewView()
-                case .senders:
-                    SenderTriageView()
-                case .history:
-                    HistoryView()
-                case .evaluation:
-                    EvaluationView()
-                case .settings:
-                    SettingsView()
+                VStack(spacing: 0) {
+                    // A failed scan must stay on screen. `isScanning` goes false the
+                    // moment the scan throws, and ScanProgressView — the only thing that
+                    // rendered the failure — stopped being shown with it, so the error
+                    // was computed and then silently discarded. A scan that fails
+                    // invisibly is indistinguishable from a scan that does nothing.
+                    if let progress = appState.scanProgress,
+                       case .failed(let message) = progress.status {
+                        ScanFailureBanner(message: message) {
+                            appState.scanProgress = nil
+                        }
+                    }
+
+                    switch appState.detailRoute {
+                    case .overview:
+                        InboxOverviewView()
+                    case .senders:
+                        SenderTriageView()
+                    case .history:
+                        HistoryView()
+                    case .evaluation:
+                        EvaluationView()
+                    case .settings:
+                        SettingsView()
+                    }
                 }
             }
         }
@@ -104,6 +118,53 @@ struct SidebarView: View {
         } message: {
             Text("This will remove the account and all its local data. Your emails on Gmail won't be affected.")
         }
+    }
+}
+
+/// Persistent, dismissible banner for a failed scan.
+///
+/// Text is selectable on purpose: the useful part of a Gmail failure is usually the
+/// provider's own message, and it needs to be copyable to be actionable.
+struct ScanFailureBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Scan failed")
+                    .fontWeight(.semibold)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // The overwhelmingly common cause, stated where it is useful rather
+                // than left for the user to work out: Google expires refresh tokens
+                // after 7 days while the OAuth consent screen is in testing mode.
+                if message.localizedCaseInsensitiveContains("invalid_grant")
+                    || message.localizedCaseInsensitiveContains("token")
+                    || message.localizedCaseInsensitiveContains("auth") {
+                    Text("If this account was connected more than a week ago, the refresh token has probably expired — Google expires them after 7 days while the OAuth consent screen is in testing mode. Remove the account from the sidebar and reconnect it.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
+                }
+            }
+
+            Spacer()
+
+            Button("Dismiss", action: onDismiss)
+                .buttonStyle(.borderless)
+                .font(.caption)
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
     }
 }
 
