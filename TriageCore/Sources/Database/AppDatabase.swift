@@ -3,7 +3,10 @@ import GRDB
 
 /// Central database manager using GRDB with migrations
 public final class AppDatabase: Sendable {
-    private let dbWriter: any DatabaseWriter
+    /// Internal rather than private so the focused extensions in sibling files
+    /// (corrections, evaluation) can reach it without this type growing to hold every
+    /// query in the app.
+    let dbWriter: any DatabaseWriter
 
     /// Shared database instance (singleton for app lifetime)
     private static var _shared: AppDatabase?
@@ -299,6 +302,49 @@ public final class AppDatabase: Sendable {
             // Stored as JSON so the config can gain fields without another migration.
             try db.alter(table: "accountSettings") { t in
                 t.add(column: "aiConfigJSON", .text)
+            }
+        }
+
+        migrator.registerMigration("v9_user_corrections") { db in
+            // Corrections outrank every other source, so they are stored rather than
+            // folded into the category they fix: a correction must survive the next
+            // recategorization, which rewrites every category column it touches.
+            try db.create(table: "userCorrection") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("senderEmail", .text).notNull()
+                // Null means the whole sender. A pattern narrows it to matching subjects,
+                // which is what makes a mixed sender correctable at all.
+                t.column("subjectPattern", .text)
+                t.column("category", .text).notNull()
+                t.column("mustKeep", .boolean).notNull()
+                t.column("previousCategory", .text)
+                t.column("previousTier", .text)
+                t.column("previousReason", .text)
+                t.column("correctedAt", .datetime).notNull()
+
+                // Correcting the same scope twice replaces rather than accumulates.
+                t.uniqueKey(["accountId", "senderEmail", "subjectPattern"])
+            }
+            try db.create(
+                index: "idx_userCorrection_lookup",
+                on: "userCorrection",
+                columns: ["accountId", "senderEmail"]
+            )
+        }
+
+        migrator.registerMigration("v10_verdict_patterns_and_abstention") { db in
+            // Per-subject splits returned by the model, as JSON arrays. Lets one
+            // sender-level call resolve a mixed sender: the model says which subjects are
+            // disposable and which must be kept, and the split is applied per message.
+            try db.alter(table: "senderVerdict") { t in
+                t.add(column: "disposableSubjects", .text)
+                t.add(column: "keepSubjects", .text)
+                // The model declining to answer is a USEFUL answer, and a different one
+                // from a low-confidence guess. Recorded so an abstention is not
+                // re-requested every scan at full price.
+                t.add(column: "isUnsure", .boolean).notNull().defaults(to: false)
             }
         }
 
@@ -1193,13 +1239,24 @@ extension AppDatabase: SenderVerdictCaching {
             arguments.append(contentsOf: normalized)
 
             let rows = try Row.fetchAll(db, sql: """
-                SELECT senderEmail, category, mustKeep, isRealPerson, confidence, reason
+                SELECT senderEmail, category, mustKeep, isRealPerson, confidence, reason,
+                       disposableSubjects, keepSubjects, isUnsure
                 FROM senderVerdict
                 WHERE accountId = ? AND modelId = ? AND promptVersion = ?
                   AND senderEmail IN (\(placeholders))
                 """,
                 arguments: StatementArguments(arguments)
             )
+
+            // Subject splits are stored as JSON arrays. A row whose JSON will not decode
+            // is treated as having no split rather than being dropped: losing the split
+            // costs precision on a mixed sender, whereas dropping the verdict would
+            // silently re-bill the model for a sender already judged.
+            let decoder = JSONDecoder()
+            func fragments(_ raw: String?) -> [String] {
+                guard let raw, let data = raw.data(using: .utf8) else { return [] }
+                return (try? decoder.decode([String].self, from: data)) ?? []
+            }
 
             var verdicts: [String: SenderVerdict] = [:]
             for row in rows {
@@ -1212,7 +1269,10 @@ extension AppDatabase: SenderVerdictCaching {
                     mustKeep: row["mustKeep"],
                     isRealPerson: row["isRealPerson"],
                     confidence: row["confidence"],
-                    reason: row["reason"]
+                    reason: row["reason"],
+                    disposableSubjects: fragments(row["disposableSubjects"]),
+                    keepSubjects: fragments(row["keepSubjects"]),
+                    isUnsure: row["isUnsure"] ?? false
                 )
             }
             return verdicts
@@ -1232,8 +1292,9 @@ extension AppDatabase: SenderVerdictCaching {
                     sql: """
                         INSERT INTO senderVerdict
                             (accountId, senderEmail, modelId, promptVersion, category,
-                             mustKeep, isRealPerson, confidence, reason, createdAt)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             mustKeep, isRealPerson, confidence, reason, createdAt,
+                             disposableSubjects, keepSubjects, isUnsure)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(accountId, senderEmail, modelId, promptVersion)
                         DO UPDATE SET
                             category = excluded.category,
@@ -1241,7 +1302,10 @@ extension AppDatabase: SenderVerdictCaching {
                             isRealPerson = excluded.isRealPerson,
                             confidence = excluded.confidence,
                             reason = excluded.reason,
-                            createdAt = excluded.createdAt
+                            createdAt = excluded.createdAt,
+                            disposableSubjects = excluded.disposableSubjects,
+                            keepSubjects = excluded.keepSubjects,
+                            isUnsure = excluded.isUnsure
                         """,
                     arguments: [
                         accountId,
@@ -1253,7 +1317,17 @@ extension AppDatabase: SenderVerdictCaching {
                         verdict.isRealPerson,
                         verdict.confidence,
                         verdict.reason,
-                        Date()
+                        Date(),
+                        // JSON so a split can grow without another migration.
+                        String(
+                            data: (try? JSONEncoder().encode(verdict.disposableSubjects)) ?? Data(),
+                            encoding: .utf8
+                        ),
+                        String(
+                            data: (try? JSONEncoder().encode(verdict.keepSubjects)) ?? Data(),
+                            encoding: .utf8
+                        ),
+                        verdict.isUnsure,
                     ]
                 )
             }

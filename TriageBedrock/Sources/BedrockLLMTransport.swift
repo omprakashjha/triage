@@ -41,7 +41,10 @@ public struct BedrockLLMTransport: LLMTransport {
     /// account and region.
     public static let defaultModelId = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
-    public func classify(senders: [SenderClassificationRequest]) async throws -> [SenderVerdict] {
+    public func classify(
+        senders: [SenderClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [SenderVerdict] {
         guard !senders.isEmpty else { return [] }
 
         let client: BedrockRuntimeClient
@@ -57,11 +60,15 @@ public struct BedrockLLMTransport: LLMTransport {
 
         let payload: JSONValue
         do {
-            payload = try await send(client, senders: senders, includeTemperature: true)
+            payload = try await send(
+                client, senders: senders, corrections: corrections, includeTemperature: true
+            )
         } catch BedrockTransportError.temperatureRejected {
             // Some newer models reject `temperature` outright (Opus 5 among them).
             // Retry once without it rather than making the user discover this per model.
-            payload = try await send(client, senders: senders, includeTemperature: false)
+            payload = try await send(
+                client, senders: senders, corrections: corrections, includeTemperature: false
+            )
         }
 
         return SenderClassificationPrompt.parseVerdicts(from: payload)
@@ -70,6 +77,7 @@ public struct BedrockLLMTransport: LLMTransport {
     private func send(
         _ client: BedrockRuntimeClient,
         senders: [SenderClassificationRequest],
+        corrections: [CorrectionExample],
         includeTemperature: Bool
     ) async throws -> JSONValue {
         let tool = BedrockRuntimeClientTypes.Tool.toolspec(
@@ -94,7 +102,7 @@ public struct BedrockLLMTransport: LLMTransport {
                 )
             ],
             modelId: modelId,
-            system: [.text(SenderClassificationPrompt.system)],
+            system: [.text(SenderClassificationPrompt.systemPrompt(corrections: corrections))],
             toolConfig: BedrockRuntimeClientTypes.ToolConfiguration(
                 // Forced: prose instead of a tool call would mean parsing free text into
                 // a decision that sets a safety tier.

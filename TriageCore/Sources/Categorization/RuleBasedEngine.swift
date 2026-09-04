@@ -99,8 +99,39 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
     /// unexamined weak rule from quietly producing another deletable water bill.
     private func categorizeEmail(_ email: EmailMetadata) -> CategorizationResult {
         let ruled = classify(email)
-        let corroborated = Self.weighingProviderOpinion(ruled, email: email)
+        let languageChecked = Self.discountingEnglishPatternsOnForeignMail(ruled, email: email)
+        let corroborated = Self.weighingProviderOpinion(languageChecked, email: email)
         return Self.enforcingEvidenceInvariant(corroborated)
+    }
+
+    /// Withdraw trust from a subject-derived verdict when the subject is not English.
+    ///
+    /// The engine's subject patterns are English strings, so on non-English mail a match is
+    /// as likely to be coincidence as comprehension. Rather than pretend otherwise, the
+    /// finding is kept as a suggestion and stripped of the authority to act — which also
+    /// pushes the sender to the model, the only component that can actually read it.
+    ///
+    /// Only SUBJECT-derived findings are affected. A listed domain means the same thing in
+    /// every language, so `chase.com` and `rabobank.nl` are untouched by this.
+    static func discountingEnglishPatternsOnForeignMail(
+        _ result: CategorizationResult,
+        email: EmailMetadata
+    ) -> CategorizationResult {
+        guard result.evidence == .strong,
+              result.reason.lowercased().contains("subject"),
+              subjectIsProbablyNotEnglish(email.subject)
+        else { return result }
+
+        return CategorizationResult(
+            messageId: result.messageId,
+            category: result.category,
+            safetyTier: result.safetyTier,
+            confidence: min(result.confidence, 0.55),
+            reason: result.reason
+                + " — but this subject is not in English, so an English keyword match "
+                + "proves little",
+            evidence: .weak
+        )
     }
 
     /// Reconcile our verdict with the mail provider's own.
@@ -177,6 +208,40 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
             reason: result.reason + " — heuristic only, needs review",
             evidence: result.evidence
         )
+    }
+
+    /// Whether a subject is probably not in English.
+    ///
+    /// Crude on purpose — it only has to be right often enough to stop an English keyword
+    /// list being trusted on mail it cannot read. Function words are the signal: they are
+    /// short, extremely common, and unlike content words they do not migrate into other
+    /// languages' marketing copy.
+    ///
+    /// The failure this prevents is specific. An English pattern can match a non-English
+    /// subject by coincidence — a brand name, a loanword, a shared word like "sale" or
+    /// "offer" — and the match then carries the full confidence of a real hit. On a mailbox
+    /// where most mail is not English, that is a steady source of confident errors, and
+    /// each one also blocks the model from being consulted.
+    static func subjectIsProbablyNotEnglish(_ subject: String) -> Bool {
+        let lowered = subject.lowercased()
+
+        // Dutch, German, French, Spanish, Italian, Portuguese function words.
+        let markers = [
+            " uw ", " je ", " jouw ", " voor ", " van ", " het ", " een ", " naar ", " bij ",
+            " zijn ", " wordt ", " onze ",
+            " der ", " die ", " das ", " und ", " für ", " ihre ", " mit ", " sie ", " ihr ",
+            " von ", " zum ",
+            " le ", " la ", " les ", " des ", " pour ", " avec ", " vous ", " votre ", " sur ",
+            " el ", " los ", " las ", " para ", " con ", " sus ", " una ",
+            " il ", " lo ", " gli ", " per ", " con ", " sua ",
+            " do ", " da ", " dos ", " para ", " com ", " sua ",
+        ]
+        let padded = " \(lowered) "
+        if markers.contains(where: { padded.contains($0) }) { return true }
+
+        // Characters that do not occur in ordinary English text.
+        let nonEnglishScalars = CharacterSet(charactersIn: "àâäåæçèéêëìîïñòôöøùûüýÿßœ")
+        return lowered.unicodeScalars.contains { nonEnglishScalars.contains($0) }
     }
 
     private func classify(_ email: EmailMetadata) -> CategorizationResult {

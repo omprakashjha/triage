@@ -51,6 +51,12 @@ public final class AICategorizationEngine: CategorizationEngine {
     private let cache: SenderVerdictCaching
     private let accountId: Int64
     private let sampleSubjects: (String) async -> [String]
+    /// Absent unless the user enabled sending body previews. Deliberately optional rather
+    /// than a flag: when disabled there is no code path that reads message content.
+    private let sampleSnippets: ((String) async -> [String])?
+    /// The user's corrections, re-read per run so a fix made a moment ago reaches the very
+    /// next batch.
+    private let correctionExamples: () async -> [CorrectionExample]
     /// Reports what the pass did. Called once per `categorize`, success or failure.
     private let onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)?
 
@@ -60,6 +66,8 @@ public final class AICategorizationEngine: CategorizationEngine {
         cache: SenderVerdictCaching,
         accountId: Int64,
         sampleSubjects: @escaping (String) async -> [String] = { _ in [] },
+        sampleSnippets: ((String) async -> [String])? = nil,
+        correctionExamples: @escaping () async -> [CorrectionExample] = { [] },
         onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)? = nil
     ) {
         self.rules = rules
@@ -67,6 +75,8 @@ public final class AICategorizationEngine: CategorizationEngine {
         self.cache = cache
         self.accountId = accountId
         self.sampleSubjects = sampleSubjects
+        self.sampleSnippets = sampleSnippets
+        self.correctionExamples = correctionExamples
         self.onDiagnostics = onDiagnostics
     }
 
@@ -118,9 +128,10 @@ public final class AICategorizationEngine: CategorizationEngine {
         let uncached = ambiguousSenders.filter { verdicts[$0] == nil }
         if !uncached.isEmpty {
             let requests = await buildRequests(for: uncached, emails: emails)
+            let learned = await correctionExamples()
             for batch in requests.chunked(into: Self.batchSize) {
                 diagnostics.batchesRequested += 1
-                let fresh = try await transport.classify(senders: batch)
+                let fresh = try await transport.classify(senders: batch, corrections: learned)
                 diagnostics.verdictsReturned += fresh.count
                 try await cache.storeVerdicts(
                     fresh,
@@ -140,11 +151,12 @@ public final class AICategorizationEngine: CategorizationEngine {
             guard let verdict = verdicts[email.senderEmail.lowercased()] else { continue }
             resultsById[email.messageId] = Self.merge(
                 rule: ruleResult,
-                verdict: verdict,
-                // Per-MESSAGE, which is what lets a mixed sender be split correctly:
-                // info@email.ns.nl is 46 promotional and 58 receipts, and one sender-level
-                // verdict cannot be right for both. The provider labelled each message
-                // individually, so corroboration is decided message by message.
+                // Resolved PER MESSAGE. Where the model named a subject split, this is
+                // where a mixed sender stops being one answer and becomes two: the
+                // marketing half and the receipts half of the same address get different
+                // verdicts from a single sender-level call.
+                verdict: verdict.resolved(forSubject: email.subject),
+                // Also per message: the provider labelled each one individually.
                 providerCategory: email.providerCategory
             )
             diagnostics.mergesApplied += 1
@@ -213,11 +225,32 @@ public final class AICategorizationEngine: CategorizationEngine {
                     sampleSubjects: Array(subjects),
                     totalEmails: senderEmails.count,
                     hasUnsubscribe: senderEmails.contains(where: \.hasListUnsubscribe),
-                    averageIntervalDays: interval
+                    averageIntervalDays: interval,
+                    // Only fetched when the user has allowed it. The closure is absent
+                    // rather than returning empty when disabled, so the code path that
+                    // reads message content does not exist unless it was turned on.
+                    sampleSnippets: await sampleSnippets?(sender) ?? [],
+                    // Counted from the mail already in hand rather than queried: the
+                    // provider's own labels are the strongest available hint that a sender
+                    // is mixed, and a mixed sender is one the model should split.
+                    providerLabelCounts: Self.providerCounts(of: senderEmails),
+                    userHasReplied: senderEmails.contains {
+                        $0.labels?.contains("SENT") ?? false
+                    }
                 )
             )
         }
         return requests
+    }
+
+    static func providerCounts(of emails: [EmailMetadata]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for email in emails {
+            if let category = email.providerCategory {
+                counts[category.displayName, default: 0] += 1
+            }
+        }
+        return counts
     }
 
     // MARK: - Merge

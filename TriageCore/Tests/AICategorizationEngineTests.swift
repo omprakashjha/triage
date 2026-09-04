@@ -6,6 +6,9 @@ private final class MockTransport: LLMTransport, @unchecked Sendable {
     let modelId: String
     let promptVersion: String
     private(set) var receivedBatches: [[SenderClassificationRequest]] = []
+    /// What the engine passed through from the user's corrections, so the prompt-feedback
+    /// path can be asserted rather than assumed.
+    private(set) var receivedCorrections: [CorrectionExample] = []
     private let verdicts: [String: SenderVerdict]
 
     init(
@@ -21,7 +24,11 @@ private final class MockTransport: LLMTransport, @unchecked Sendable {
     var callCount: Int { receivedBatches.count }
     var sendersAsked: [String] { receivedBatches.flatMap { $0.map(\.senderEmail) } }
 
-    func classify(senders: [SenderClassificationRequest]) async throws -> [SenderVerdict] {
+    func classify(
+        senders: [SenderClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [SenderVerdict] {
+        receivedCorrections = corrections
         receivedBatches.append(senders)
         return senders.compactMap { verdicts[$0.senderEmail.lowercased()] }
     }

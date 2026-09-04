@@ -147,6 +147,18 @@ public enum EmailCategory: String, Codable, CaseIterable, Sendable {
     case personal
     case unknown
 
+    /// Whether mail of this category is the kind a bulk cleaner exists to remove.
+    ///
+    /// Only a claim about the CATEGORY, never about a specific message — which is why the
+    /// safety tier is tracked separately. A promotional email from a sender the user cares
+    /// about is still promotional and still must not be deleted.
+    public var isTypicallyDisposable: Bool {
+        switch self {
+        case .promotion, .newsletter: return true
+        case .notification, .transactional, .social, .personal, .unknown: return false
+        }
+    }
+
     public var displayName: String {
         rawValue.capitalized
     }
