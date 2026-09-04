@@ -98,7 +98,71 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
     /// a category but cannot authorise acting on it. This is what stops the next
     /// unexamined weak rule from quietly producing another deletable water bill.
     private func categorizeEmail(_ email: EmailMetadata) -> CategorizationResult {
-        Self.enforcingEvidenceInvariant(classify(email))
+        let ruled = classify(email)
+        let corroborated = Self.weighingProviderOpinion(ruled, email: email)
+        return Self.enforcingEvidenceInvariant(corroborated)
+    }
+
+    /// Reconcile our verdict with the mail provider's own.
+    ///
+    /// The provider is an independent classifier that works in every language, and it
+    /// already labelled every message before we looked at it. Where it agrees, we can act
+    /// with more confidence than either source alone justifies; where it contradicts us on
+    /// the axis that matters — is this mail disposable — it is the more credible of the
+    /// two, because our side is an English keyword list.
+    ///
+    /// Never used to make mail MORE deletable than the rules found it. A provider
+    /// promotions label is corroboration for auto-action only when our own rules
+    /// independently reached the same conclusion.
+    static func weighingProviderOpinion(
+        _ result: CategorizationResult,
+        email: EmailMetadata
+    ) -> CategorizationResult {
+        guard let provider = email.providerCategory else { return result }
+
+        // A contact is already settled by stronger evidence than any label.
+        if result.safetyTier == .protected_ { return result }
+
+        let weThinkDisposable = result.category == .promotion || result.category == .newsletter
+
+        // Contradiction on disposability: trust the provider, and say so.
+        if weThinkDisposable && provider.arguesForKeeping {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: result.category,
+                safetyTier: .review,
+                confidence: 0.4,
+                reason: result.reason
+                    + " — but Gmail filed it under \(provider.displayName), which is where "
+                    + "bills and confirmations go, so this disagreement needs review",
+                evidence: .weak
+            )
+        }
+
+        // Independent agreement: two classifiers, one of them multilingual, same answer.
+        if weThinkDisposable && provider.isBulkMarketing {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: result.category,
+                safetyTier: result.safetyTier,
+                confidence: max(result.confidence, 0.9),
+                reason: result.reason + " — and Gmail also filed it under Promotions",
+                evidence: .strong
+            )
+        }
+
+        if result.category == .social && provider == .social {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: .social,
+                safetyTier: result.safetyTier,
+                confidence: max(result.confidence, 0.9),
+                reason: result.reason + " — and Gmail also filed it under Social",
+                evidence: .strong
+            )
+        }
+
+        return result
     }
 
     static func enforcingEvidenceInvariant(_ result: CategorizationResult) -> CategorizationResult {

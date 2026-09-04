@@ -394,3 +394,112 @@ final class SenderPatternDatabaseTests: XCTestCase {
         XCTAssertFalse(patterns.isTransactionalDomain("randomshop.com"))
     }
 }
+
+// MARK: - The mail provider's own opinion
+
+/// Gmail labels every message with exactly one `CATEGORY_*`, in any language, before this
+/// app looks at it. These tests pin how that second opinion is used — as a veto when it
+/// contradicts us about disposability, as corroboration when it agrees, and never as a
+/// licence to delete more than the rules found on their own.
+final class ProviderCategorySignalTests: XCTestCase {
+    private var engine: RuleBasedEngine!
+
+    override func setUp() {
+        super.setUp()
+        engine = RuleBasedEngine()
+    }
+
+    private func makeEmail(
+        senderEmail: String,
+        subject: String,
+        labels: [String],
+        hasListUnsubscribe: Bool = false
+    ) -> EmailMetadata {
+        var email = EmailMetadata(
+            accountId: 1,
+            messageId: UUID().uuidString,
+            threadId: "t",
+            sender: "Sender <\(senderEmail)>",
+            senderEmail: senderEmail,
+            subject: subject,
+            date: Date(),
+            hasListUnsubscribe: hasListUnsubscribe
+        )
+        email.labels = labels
+        return email
+    }
+
+    func testUpdatesLabelVetoesAutoAction() async throws {
+        // The real case in miniature: the rules say promotional, Gmail says Updates —
+        // the bucket bills and confirmations land in. Measured on a live mailbox, 76 of
+        // the 122 emails the rules called promotional were labelled Updates by Gmail.
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Bekijk onze aanbiedingen",
+            labels: ["INBOX", "UNREAD", "CATEGORY_UPDATES"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(
+            results[0].safetyTier, .review,
+            "a disagreement about disposability must not resolve itself by guessing"
+        )
+        XCTAssertEqual(results[0].evidence, .weak)
+        XCTAssertTrue(results[0].reason.contains("Updates"))
+    }
+
+    func testPromotionsLabelCorroboratesAutoAction() async throws {
+        // The other direction matters just as much: independent agreement restores the
+        // cleanup power that requiring strong evidence would otherwise have cost.
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Weekend sale",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].evidence, .strong)
+        XCTAssertGreaterThanOrEqual(results[0].confidence, 0.9)
+    }
+
+    func testLabelNeverMakesMailMoreDeletable() async throws {
+        // A promotions label must not override a transactional finding. The provider
+        // corroborates a conclusion the rules already reached; it is not a licence.
+        let email = makeEmail(
+            senderEmail: "noreply@chase.com",
+            subject: "Your statement is ready",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .transactional)
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    func testLabelDoesNotOverrideAKnownContact() async throws {
+        let contactEngine = RuleBasedEngine(knownContacts: ["friend@example.com"])
+        let email = makeEmail(
+            senderEmail: "friend@example.com",
+            subject: "Sale on now",
+            labels: ["CATEGORY_PROMOTIONS"]
+        )
+        let results = try await contactEngine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .protected_)
+    }
+
+    func testMailWithNoProviderLabelIsUnaffected() async throws {
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Weekend sale",
+            labels: ["INBOX", "UNREAD"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .promotion)
+        XCTAssertFalse(results[0].reason.contains("Gmail"))
+    }
+}

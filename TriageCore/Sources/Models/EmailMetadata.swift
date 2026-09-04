@@ -23,6 +23,22 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
 
     // Gmail-specific
     public var labels: [String]?       // Gmail label IDs
+
+    /// Gmail's OWN classification of this message, from its label IDs.
+    ///
+    /// Worth far more than it looks. Gmail's classifier is multilingual and trained on
+    /// an enormous corpus, whereas this app's rules are hand-written English keyword and
+    /// domain lists. Measured on a real 403-email mailbox, Gmail disagreed with the
+    /// rules on 76 of 122 emails the rules called promotional — calling them Updates,
+    /// i.e. statements and confirmations. It costs nothing: the labels arrive with every
+    /// message and were already being stored and ignored.
+    public var providerCategory: ProviderCategory? {
+        guard let labels else { return nil }
+        for label in labels {
+            if let category = ProviderCategory(gmailLabel: label) { return category }
+        }
+        return nil
+    }
     public var isUnread: Bool
 
     // Categorization
