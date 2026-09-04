@@ -129,33 +129,82 @@ public enum SenderClassificationPrompt {
         """
 
     /// JSON Schema for the forced tool-use / structured-output call.
-    public static let outputSchema: [String: Any] = [
-        "type": "object",
-        "properties": [
-            "verdicts": [
-                "type": "array",
-                "items": [
-                    "type": "object",
-                    "properties": [
-                        "senderEmail": ["type": "string"],
-                        "category": [
-                            "type": "string",
-                            "enum": EmailCategory.allCases.map(\.rawValue),
-                        ],
-                        "mustKeep": ["type": "boolean"],
-                        "isRealPerson": ["type": "boolean"],
-                        "confidence": ["type": "number", "minimum": 0, "maximum": 1],
-                        "reason": ["type": "string", "maxLength": 160],
-                    ],
-                    "required": [
-                        "senderEmail", "category", "mustKeep",
-                        "isRealPerson", "confidence", "reason",
-                    ],
-                ],
-            ]
-        ],
-        "required": ["verdicts"],
-    ]
+    ///
+    /// Typed as `JSONValue` rather than `[String: Any]` so it stays `Sendable` and can
+    /// be bridged to the SDK's document type without casting.
+    public static var outputSchema: JSONValue {
+        .object([
+            "type": "object",
+            "properties": .object([
+                "verdicts": .object([
+                    "type": "array",
+                    "items": .object([
+                        "type": "object",
+                        "properties": .object([
+                            "senderEmail": .object(["type": "string"]),
+                            "category": .object([
+                                "type": "string",
+                                "enum": .array(EmailCategory.allCases.map { .string($0.rawValue) }),
+                            ]),
+                            "mustKeep": .object(["type": "boolean"]),
+                            "isRealPerson": .object(["type": "boolean"]),
+                            "confidence": .object([
+                                "type": "number", "minimum": 0, "maximum": 1,
+                            ]),
+                            "reason": .object(["type": "string", "maxLength": 160]),
+                        ]),
+                        "required": .array([
+                            "senderEmail", "category", "mustKeep",
+                            "isRealPerson", "confidence", "reason",
+                        ]),
+                    ]),
+                ])
+            ]),
+            "required": .array(["verdicts"]),
+        ])
+    }
+
+    public static let toolName = "record_sender_verdicts"
+
+    public static let toolDescription =
+        "Record one classification verdict per sender that was provided."
+
+    /// Parse the model's tool payload into verdicts.
+    ///
+    /// Tolerant about what it drops and strict about what it keeps: a malformed entry is
+    /// skipped rather than defaulted, because a verdict with a silently invented field
+    /// would feed the tier decision. Confidence is clamped, and an unrecognised category
+    /// falls back to `.unknown` with `mustKeep` forced true — an unparseable verdict must
+    /// never make mail more deletable.
+    public static func parseVerdicts(from payload: JSONValue) -> [SenderVerdict] {
+        guard let entries = payload["verdicts"]?.arrayValue else { return [] }
+
+        return entries.compactMap { entry -> SenderVerdict? in
+            guard let sender = entry["senderEmail"]?.stringValue, sender.contains("@") else {
+                return nil
+            }
+
+            let rawCategory = entry["category"]?.stringValue ?? ""
+            let parsedCategory = EmailCategory(rawValue: rawCategory)
+            let category = parsedCategory ?? .unknown
+
+            // An unparseable category means we do not actually know what this is.
+            let mustKeep = (entry["mustKeep"]?.boolValue ?? true) || parsedCategory == nil
+            let isRealPerson = entry["isRealPerson"]?.boolValue ?? false
+
+            let confidence = min(max(entry["confidence"]?.doubleValue ?? 0, 0), 1)
+            let reason = entry["reason"]?.stringValue ?? "no reason given"
+
+            return SenderVerdict(
+                senderEmail: sender,
+                category: category,
+                mustKeep: mustKeep,
+                isRealPerson: isRealPerson,
+                confidence: parsedCategory == nil ? min(confidence, 0.3) : confidence,
+                reason: reason
+            )
+        }
+    }
 
     /// Render the user-message payload for a batch.
     ///

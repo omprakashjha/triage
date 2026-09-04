@@ -322,14 +322,111 @@ final class AICategorizationEngineTests: XCTestCase {
     }
 
     func testSchemaEnumeratesEveryCategory() {
-        guard let verdicts = SenderClassificationPrompt.outputSchema["properties"] as? [String: Any],
-              let array = verdicts["verdicts"] as? [String: Any],
-              let items = array["items"] as? [String: Any],
-              let properties = items["properties"] as? [String: Any],
-              let category = properties["category"] as? [String: Any],
-              let cases = category["enum"] as? [String] else {
+        guard let cases = SenderClassificationPrompt.outputSchema["properties"]?["verdicts"]?["items"]?["properties"]?["category"]?["enum"]?.arrayValue else {
             return XCTFail("schema shape changed")
         }
-        XCTAssertEqual(Set(cases), Set(EmailCategory.allCases.map(\.rawValue)))
+        XCTAssertEqual(
+            Set(cases.compactMap(\.stringValue)),
+            Set(EmailCategory.allCases.map(\.rawValue))
+        )
+    }
+
+    // MARK: - Response parsing
+
+    func testParseVerdictsFromWellFormedPayload() {
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "a@shop.com",
+                    "category": "promotion",
+                    "mustKeep": false,
+                    "isRealPerson": false,
+                    "confidence": 0.92,
+                    "reason": "sale subjects, unsubscribe present",
+                ])
+            ])
+        ])
+
+        let verdicts = SenderClassificationPrompt.parseVerdicts(from: payload)
+
+        XCTAssertEqual(verdicts.count, 1)
+        XCTAssertEqual(verdicts[0].category, .promotion)
+        XCTAssertFalse(verdicts[0].mustKeep)
+        XCTAssertEqual(verdicts[0].confidence, 0.92)
+    }
+
+    func testUnknownCategoryForcesMustKeep() {
+        // An unparseable category means we do not know what this is, so it must not
+        // become more deletable than it was.
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "a@shop.com",
+                    "category": "marketing-blast",
+                    "mustKeep": false,
+                    "isRealPerson": false,
+                    "confidence": 0.99,
+                    "reason": "made up category",
+                ])
+            ])
+        ])
+
+        let verdicts = SenderClassificationPrompt.parseVerdicts(from: payload)
+
+        XCTAssertEqual(verdicts[0].category, .unknown)
+        XCTAssertTrue(verdicts[0].mustKeep, "an unrecognised category must not be treated as disposable")
+        XCTAssertLessThanOrEqual(verdicts[0].confidence, 0.3)
+        XCTAssertEqual(verdicts[0].impliedTier, .review)
+    }
+
+    func testMalformedEntriesAreSkippedNotDefaulted() {
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object(["category": "promotion"]),                 // no sender
+                .object(["senderEmail": "not-an-address"]),          // not an address
+                .object([
+                    "senderEmail": "good@shop.com",
+                    "category": "newsletter",
+                    "mustKeep": false,
+                    "isRealPerson": false,
+                    "confidence": 0.8,
+                    "reason": "digest",
+                ]),
+            ])
+        ])
+
+        let verdicts = SenderClassificationPrompt.parseVerdicts(from: payload)
+
+        XCTAssertEqual(verdicts.map(\.senderEmail), ["good@shop.com"])
+    }
+
+    func testConfidenceIsClamped() {
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "a@shop.com", "category": "promotion",
+                    "mustKeep": false, "isRealPerson": false,
+                    "confidence": 7.5, "reason": "out of range",
+                ])
+            ])
+        ])
+
+        XCTAssertEqual(SenderClassificationPrompt.parseVerdicts(from: payload)[0].confidence, 1.0)
+    }
+
+    func testMissingMustKeepDefaultsToSafeSide() {
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "a@shop.com", "category": "promotion",
+                    "confidence": 0.8, "reason": "no mustKeep field",
+                ])
+            ])
+        ])
+
+        XCTAssertTrue(
+            SenderClassificationPrompt.parseVerdicts(from: payload)[0].mustKeep,
+            "an absent safety field must default to the cautious answer"
+        )
     }
 }

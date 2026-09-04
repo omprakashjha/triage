@@ -295,6 +295,13 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v8_ai_config") { db in
+            // Stored as JSON so the config can gain fields without another migration.
+            try db.alter(table: "accountSettings") { t in
+                t.add(column: "aiConfigJSON", .text)
+            }
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -885,7 +892,7 @@ extension AppDatabase {
         try await dbWriter.read { db in
             guard let row = try Row.fetchOne(
                 db,
-                sql: "SELECT actionRulesJSON, scanScope FROM accountSettings WHERE accountId = ?",
+                sql: "SELECT actionRulesJSON, scanScope, aiConfigJSON FROM accountSettings WHERE accountId = ?",
                 arguments: [accountId]
             ) else {
                 return AccountSettings(accountId: accountId)
@@ -898,29 +905,53 @@ extension AppDatabase {
                 rules = decoded
             }
 
+            var ai = AIConfig()
+            if let json: String = row["aiConfigJSON"],
+               let data = json.data(using: .utf8),
+               let decoded = try? JSONDecoder().decode(AIConfig.self, from: data) {
+                ai = decoded
+            }
+
             let scope = (row["scanScope"] as String?)
                 .flatMap(ScanScope.init(rawValue:)) ?? .unreadOnly
 
-            return AccountSettings(accountId: accountId, actionRules: rules, scanScope: scope)
+            return AccountSettings(
+                accountId: accountId,
+                actionRules: rules,
+                scanScope: scope,
+                aiConfig: ai
+            )
         }
     }
 
     public func saveAccountSettings(_ settings: AccountSettings) async throws {
-        let json = String(
+        let rulesJSON = String(
             data: try JSONEncoder().encode(settings.actionRules),
+            encoding: .utf8
+        )
+        let aiJSON = String(
+            data: try JSONEncoder().encode(settings.aiConfig),
             encoding: .utf8
         )
         try await dbWriter.write { db in
             try db.execute(
                 sql: """
-                    INSERT INTO accountSettings (accountId, actionRulesJSON, scanScope, updatedAt)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO accountSettings
+                        (accountId, actionRulesJSON, scanScope, aiConfigJSON, updatedAt)
+                    VALUES (?, ?, ?, ?, ?)
                     ON CONFLICT(accountId) DO UPDATE SET
                         actionRulesJSON = excluded.actionRulesJSON,
                         scanScope = excluded.scanScope,
+                        aiConfigJSON = excluded.aiConfigJSON,
                         updatedAt = excluded.updatedAt
                     """,
-                arguments: [settings.accountId, json, settings.scanScope.rawValue, Date()]
+                arguments: [
+                    settings.accountId,
+                    rulesJSON,
+                    settings.scanScope.rawValue,
+                    aiJSON,
+                    Date()
+                ]
             )
         }
     }

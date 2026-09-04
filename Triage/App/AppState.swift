@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import TriageCore
+import TriageBedrock
 
 @MainActor
 final class AppState: ObservableObject {
@@ -21,6 +22,9 @@ final class AppState: ObservableObject {
     @Published var evaluationReport: EvaluationReport?
     @Published var isEvaluating = false
     @Published var exportedGoldenSetPath: String?
+    /// Result of the last connection test, or an announced fallback. Never silent.
+    @Published var aiStatusMessage: String?
+    @Published var isTestingAI = false
     @Published var senderSummaries: [SenderSummary] = []
     @Published var senderRules: [SenderRule] = []
     @Published var settings: AccountSettings?
@@ -172,9 +176,13 @@ final class AppState: ObservableObject {
             // that assigns the protected tier.
             let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
             knownContactCount = contacts.count
+            if settings == nil { await loadSettings(accountId: accountId) }
 
-            let engine = RuleBasedEngine(knownContacts: contacts)
-            let results = try await engine.categorize(emails: uncategorized)
+            let results = try await categorizeWithFallback(
+                emails: uncategorized,
+                accountId: accountId,
+                contacts: contacts
+            )
             try await database.updateCategories(results, accountId: accountId)
 
             // Refresh stats
@@ -191,12 +199,16 @@ final class AppState: ObservableObject {
         do {
             let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
             knownContactCount = contacts.count
+            if settings == nil { await loadSettings(accountId: accountId) }
 
             let all = try await database.fetchEmails(accountId: accountId, limit: 50000, offset: 0)
             guard !all.isEmpty else { return }
 
-            let engine = RuleBasedEngine(knownContacts: contacts)
-            let results = try await engine.categorize(emails: all)
+            let results = try await categorizeWithFallback(
+                emails: all,
+                accountId: accountId,
+                contacts: contacts
+            )
             try await database.updateCategories(results, accountId: accountId)
             accountStats = try await database.accountStats(accountId: accountId)
         } catch {
@@ -584,6 +596,110 @@ final class AppState: ObservableObject {
         } catch {
             lastExecutionError = "Export failed: \(error.localizedDescription)"
             return nil
+        }
+    }
+
+    // MARK: - Engine Selection
+
+    /// The categorization engine for this account.
+    ///
+    /// Returns the rules-only engine unless cloud categorization is explicitly enabled.
+    private func makeEngine(accountId: Int64, contacts: Set<String>) -> CategorizationEngine {
+        let rules = RuleBasedEngine(knownContacts: contacts)
+
+        guard let ai = settings?.aiConfig, ai.isEnabled else { return rules }
+
+        let transport = BedrockLLMTransport(
+            modelId: ai.modelId.isEmpty ? BedrockLLMTransport.defaultModelId : ai.modelId,
+            region: ai.region.isEmpty ? nil : ai.region
+        )
+
+        let db = database
+        return AICategorizationEngine(
+            rules: rules,
+            transport: transport,
+            cache: db,
+            accountId: accountId,
+            sampleSubjects: { sender in
+                (try? await db.sampleSubjects(accountId: accountId, senderEmail: sender)) ?? []
+            }
+        )
+    }
+
+    /// Categorize with the configured engine, falling back to rules on failure.
+    ///
+    /// The fallback ANNOUNCES itself. A silent degradation to local-only would leave the
+    /// user believing they had cloud classification when an expired SSO session meant
+    /// they did not — and the two produce measurably different tiers.
+    private func categorizeWithFallback(
+        emails: [EmailMetadata],
+        accountId: Int64,
+        contacts: Set<String>
+    ) async throws -> [CategorizationResult] {
+        let engine = makeEngine(accountId: accountId, contacts: contacts)
+
+        if engine is RuleBasedEngine {
+            return try await engine.categorize(emails: emails)
+        }
+
+        do {
+            let results = try await engine.categorize(emails: emails)
+            aiStatusMessage = nil
+            return results
+        } catch {
+            aiStatusMessage = "Cloud categorization unavailable — used local rules only. "
+                + (error.localizedDescription)
+            return try await RuleBasedEngine(knownContacts: contacts).categorize(emails: emails)
+        }
+    }
+
+    func updateAIConfig(_ config: AIConfig, accountId: Int64) async {
+        var updated = settings ?? AccountSettings(accountId: accountId)
+        updated.aiConfig = config
+        settings = updated
+        try? await database.saveAccountSettings(updated)
+    }
+
+    /// Verify credentials and model access with one real call.
+    ///
+    /// Listing models is not proof: a model can appear in the catalogue and still reject
+    /// forced tool use, which is what this pipeline depends on.
+    func testAIConnection(accountId: Int64) async {
+        isTestingAI = true
+        aiStatusMessage = nil
+        defer { isTestingAI = false }
+
+        guard let ai = settings?.aiConfig else {
+            aiStatusMessage = "No settings loaded."
+            return
+        }
+
+        let transport = BedrockLLMTransport(
+            modelId: ai.modelId.isEmpty ? BedrockLLMTransport.defaultModelId : ai.modelId,
+            region: ai.region.isEmpty ? nil : ai.region
+        )
+
+        let probe = SenderClassificationRequest(
+            senderEmail: "deals@example-retailer.com",
+            displayName: "Example Retailer",
+            sampleSubjects: ["50% off this weekend only", "Your order has shipped"],
+            totalEmails: 12,
+            hasUnsubscribe: true,
+            averageIntervalDays: 3
+        )
+
+        do {
+            let verdicts = try await transport.classify(senders: [probe])
+            if let verdict = verdicts.first {
+                aiStatusMessage = "Connected. \(transport.modelId) classified the test sender as "
+                    + "\(verdict.category.displayName) "
+                    + "(\(Int(verdict.confidence * 100))% confident, mustKeep: \(verdict.mustKeep))."
+            } else {
+                aiStatusMessage = "The model answered but returned no verdict — "
+                    + "it may not support forced tool use."
+            }
+        } catch {
+            aiStatusMessage = "Failed: \(error.localizedDescription)"
         }
     }
 

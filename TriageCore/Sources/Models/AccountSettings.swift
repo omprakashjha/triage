@@ -61,19 +61,49 @@ public enum ScanScope: String, Codable, CaseIterable, Sendable {
     }
 }
 
+/// Cloud categorization configuration.
+///
+/// Off by default. The app is otherwise entirely local — enabling this is the one
+/// choice that sends anything off the machine, so it is opt-in and never implicit.
+public struct AIConfig: Codable, Sendable, Equatable {
+    public var isEnabled: Bool
+    /// Empty means the transport's own default.
+    public var modelId: String
+    /// Empty means "use the region from the AWS profile". Setting this explicitly
+    /// OVERRIDES the profile, which is rarely what someone wants.
+    public var region: String
+
+    public init(isEnabled: Bool = false, modelId: String = "", region: String = "") {
+        self.isEnabled = isEnabled
+        self.modelId = modelId
+        self.region = region
+    }
+
+    /// What actually leaves the machine when this is on. Shown to the user verbatim.
+    public static let egressDescription = """
+        Sender address, display name, message counts, how often they write, and up to \
+        five subject lines per sender. Message bodies are never sent — the app does not \
+        fetch them at all. Only senders the local rules could not resolve are sent, and \
+        each sender is sent at most once per model and prompt version.
+        """
+}
+
 /// Per-account persisted configuration.
 public struct AccountSettings: Sendable, Equatable {
     public let accountId: Int64
     public var actionRules: ActionRules
     public var scanScope: ScanScope
+    public var aiConfig: AIConfig
 
     public init(
         accountId: Int64,
         actionRules: ActionRules = .default,
-        scanScope: ScanScope = .unreadOnly
+        scanScope: ScanScope = .unreadOnly,
+        aiConfig: AIConfig = AIConfig()
     ) {
         self.accountId = accountId
         self.actionRules = actionRules
         self.scanScope = scanScope
+        self.aiConfig = aiConfig
     }
 }

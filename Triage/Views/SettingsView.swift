@@ -1,5 +1,6 @@
 import SwiftUI
 import TriageCore
+import TriageBedrock
 
 /// Scan scope, per-category action rules, and the standing sender rules.
 ///
@@ -16,6 +17,8 @@ struct SettingsView: View {
                 actionRulesSection
                 Divider()
                 senderRulesSection
+                Divider()
+                aiSection
                 Divider()
                 maintenanceSection
             }
@@ -188,6 +191,126 @@ struct SettingsView: View {
                     .padding(.vertical, 2)
                 }
             }
+        }
+    }
+
+    // MARK: - AI
+
+    private var aiSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Cloud categorization (optional)")
+                .font(.headline)
+
+            Text("Everything else in this app runs locally. Turning this on is the only thing that sends data off your machine, so it is off by default.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Toggle("Use Amazon Bedrock for senders the local rules cannot resolve", isOn: Binding(
+                get: { appState.settings?.aiConfig.isEnabled ?? false },
+                set: { newValue in
+                    Task {
+                        guard let accountId = appState.selectedAccount?.id else { return }
+                        var config = appState.settings?.aiConfig ?? AIConfig()
+                        config.isEnabled = newValue
+                        await appState.updateAIConfig(config, accountId: accountId)
+                    }
+                }
+            ))
+
+            // Stated plainly rather than buried: the user is agreeing to specific egress.
+            DisclosureGroup("What gets sent") {
+                Text(AIConfig.egressDescription)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.top, 4)
+            }
+            .font(.caption)
+
+            if appState.settings?.aiConfig.isEnabled == true {
+                VStack(alignment: .leading, spacing: 8) {
+                    LabeledContent("Model") {
+                        TextField(
+                            BedrockLLMTransport.defaultModelId,
+                            text: Binding(
+                                get: { appState.settings?.aiConfig.modelId ?? "" },
+                                set: { newValue in
+                                    Task {
+                                        guard let accountId = appState.selectedAccount?.id else { return }
+                                        var config = appState.settings?.aiConfig ?? AIConfig()
+                                        config.modelId = newValue
+                                        await appState.updateAIConfig(config, accountId: accountId)
+                                    }
+                                }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    LabeledContent("Region") {
+                        TextField(
+                            "leave blank to use your AWS profile's region",
+                            text: Binding(
+                                get: { appState.settings?.aiConfig.region ?? "" },
+                                set: { newValue in
+                                    Task {
+                                        guard let accountId = appState.selectedAccount?.id else { return }
+                                        var config = appState.settings?.aiConfig ?? AIConfig()
+                                        config.region = newValue
+                                        await appState.updateAIConfig(config, accountId: accountId)
+                                    }
+                                }
+                            )
+                        )
+                        .textFieldStyle(.roundedBorder)
+                    }
+
+                    Text("Blank region means your AWS profile decides. Setting it here overrides the profile, which is rarely what you want. An app launched from Finder cannot see AWS_PROFILE, so the profile must be named `default`.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+
+                    Button {
+                        Task {
+                            if let accountId = appState.selectedAccount?.id {
+                                await appState.testAIConnection(accountId: accountId)
+                            }
+                        }
+                    } label: {
+                        if appState.isTestingAI {
+                            ProgressView().controlSize(.small)
+                            Text("Testing…")
+                        } else {
+                            Label("Test connection", systemImage: "bolt.horizontal")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(appState.isTestingAI)
+
+                    Text("Sends one synthetic sender. Listing models is not proof — a model can appear in the catalogue and still reject the forced tool call this depends on.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(.leading, 20)
+            }
+
+            if let message = appState.aiStatusMessage {
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(message.hasPrefix("Connected") ? .green : .orange)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
+            Label(
+                "A model verdict can only ever make mail safer. Moving mail toward deletion always requires the local rules to agree.",
+                systemImage: "lock.shield"
+            )
+            .font(.caption2)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
         }
     }
 
