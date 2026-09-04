@@ -54,6 +54,10 @@ final class AppState: ObservableObject {
     private let database: AppDatabase
     private let contactDetector: ContactDetector
     private let unsubscribeService = UnsubscribeService()
+    /// ONE auth service for the app's lifetime. Constructing a fresh one per call threw
+    /// away its in-process token cache, so every scan re-authorised against the
+    /// Keychain and produced another password prompt.
+    let authService = GmailAuthService(clientId: Secrets.gmailClientId)
     private var gmailService: GmailService?
     private var batchExecutor: BatchExecutor?
 
@@ -85,7 +89,6 @@ final class AppState: ObservableObject {
         do {
             // Ensure Gmail service is configured
             if gmailService == nil {
-                let authService = GmailAuthService(clientId: Secrets.gmailClientId)
                 let tokens = try await authService.getValidTokens()
                 configureGmail(with: tokens)
             }
@@ -785,7 +788,6 @@ final class AppState: ObservableObject {
                 batchExecutor = nil
             }
             // Clear stored OAuth tokens
-            let authService = GmailAuthService(clientId: Secrets.gmailClientId)
             try? authService.signOut()
         } catch {
             print("Failed to delete account: \(error)")

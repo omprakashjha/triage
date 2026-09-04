@@ -474,8 +474,9 @@ struct AddAccountView: View {
         defer { isAuthenticating = false }
 
         do {
-            let authService = GmailAuthService(clientId: Secrets.gmailClientId)
-            let tokens = try await authService.authenticate()
+            // Uses AppState's shared auth service, so the token it stores is already in
+            // that instance's cache and the following scan needs no further prompt.
+            let tokens = try await appState.authService.authenticate()
             appState.configureGmail(with: tokens)
 
             // Save the account to the database
