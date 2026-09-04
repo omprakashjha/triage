@@ -105,12 +105,25 @@ PLIST
 # database to Application Support. Sandboxing it properly needs per-capability
 # entitlements and a container migration for the existing database, which is a
 # distribution concern rather than a local-run one.
-echo "==> signing (ad-hoc)"
-# Ad-hoc is enough to give the binary a stable identity WITHIN a build. Note that the
-# cdhash changes on every rebuild, so macOS re-prompts for Keychain access after each
-# build — a Developer ID certificate is what makes that persist across builds, and
-# distribution would additionally need notarisation.
-codesign --force --deep --sign - --options runtime "$APP" 2>&1 | sed 's/^/    /'
+#
+# Signing identity: prefer a stable certificate over ad-hoc.
+#
+# This is not cosmetic. macOS binds Keychain ACLs to the code signature, and an ad-hoc
+# signature's cdhash changes on EVERY rebuild — so each new build is a stranger to the
+# stored Gmail tokens and macOS re-prompts for the login password on every access.
+# Signing with a certificate makes the designated requirement depend on the cert
+# instead, so "Always Allow" survives rebuilds. Run Scripts/setup-signing.sh once.
+SIGN_IDENTITY="Triage Local Signing"
+if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+    echo "==> signing with '$SIGN_IDENTITY'"
+    codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$APP" 2>&1 | sed 's/^/    /'
+else
+    echo "==> signing (ad-hoc — no stable identity found)"
+    echo "    NOTE: ad-hoc means macOS will ask for your login password every time the"
+    echo "    app reads its stored Gmail tokens, and again after each rebuild."
+    echo "    Run Scripts/setup-signing.sh once to stop that."
+    codesign --force --deep --sign - --options runtime "$APP" 2>&1 | sed 's/^/    /'
+fi
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
 
 echo
