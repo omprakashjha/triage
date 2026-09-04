@@ -53,5 +53,14 @@ let package = Package(
             dependencies: ["TriageCore"],
             path: "TriageCore/Tests"
         ),
+        // Live integration tests. Every test here SKIPS unless TRIAGE_LIVE_BEDROCK=1,
+        // so a normal `swift test` never makes a network call, needs credentials, or
+        // spends money — but the transport stays verifiable on demand rather than by
+        // assumption.
+        .testTarget(
+            name: "TriageBedrockTests",
+            dependencies: ["TriageCore", "TriageBedrock"],
+            path: "TriageBedrock/Tests"
+        ),
     ]
 )
