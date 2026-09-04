@@ -326,15 +326,25 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 12) {
-                Button("Re-categorize all mail") {
+                Button {
                     Task {
                         if let accountId = appState.selectedAccount?.id {
                             await appState.recategorizeAll(accountId: accountId)
                             await appState.applySenderRules(accountId: accountId)
                         }
                     }
+                } label: {
+                    if appState.isRecategorizing {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small)
+                            Text("Working…")
+                        }
+                    } else {
+                        Text("Re-categorize all mail")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(appState.isRecategorizing || appState.selectedAccount == nil)
 
                 Button("Re-apply sender rules") {
                     Task {
@@ -344,6 +354,23 @@ struct SettingsView: View {
                     }
                 }
                 .buttonStyle(.bordered)
+                .disabled(appState.isRecategorizing)
+            }
+
+            if appState.selectedAccount == nil {
+                Text("Select an account in the sidebar first — these act on one account.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            // Outcome, stated explicitly. Previously this ran and reported nothing at
+            // all, so a successful run and a dead button looked identical.
+            if let status = appState.maintenanceStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(status.contains("failed") ? .red : .secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if appState.lastRuleMatchCount > 0 {

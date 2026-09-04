@@ -47,6 +47,9 @@ final class AppState: ObservableObject {
     @Published var knownContactCount = 0
     @Published var isRefreshingContacts = false
     @Published var isReconnecting = false
+    /// Progress and outcome of the maintenance actions, so they are never silent.
+    @Published var isRecategorizing = false
+    @Published var maintenanceStatus: String?
     /// Contact detection failing is a narrower problem than the scan failing, and is
     /// reported separately so the two are not confused.
     @Published var contactDetectionWarning: String?
@@ -237,13 +240,25 @@ final class AppState: ObservableObject {
     /// Needed after the contact list changes, since previously-categorized mail
     /// was judged against the older (possibly empty) contact set.
     func recategorizeAll(accountId: Int64) async {
+        isRecategorizing = true
+        maintenanceStatus = "Re-categorizing…"
+        defer { isRecategorizing = false }
+
         do {
             let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
             knownContactCount = contacts.count
             if settings == nil { await loadSettings(accountId: accountId) }
 
             let all = try await database.fetchEmails(accountId: accountId, limit: 50000, offset: 0)
-            guard !all.isEmpty else { return }
+            guard !all.isEmpty else {
+                maintenanceStatus = "Nothing to re-categorize for this account."
+                return
+            }
+
+            let usingAI = settings?.aiConfig.isEnabled == true
+            maintenanceStatus = usingAI
+                ? "Re-categorizing \(all.count) emails (cloud enabled)…"
+                : "Re-categorizing \(all.count) emails…"
 
             let results = try await categorizeWithFallback(
                 emails: all,
@@ -252,8 +267,26 @@ final class AppState: ObservableObject {
             )
             try await database.updateCategories(results, accountId: accountId)
             accountStats = try await database.accountStats(accountId: accountId)
+
+            // Report what actually changed. A maintenance action that runs silently is
+            // indistinguishable from a button that does nothing.
+            let aiInfluenced = results.filter { $0.reason.contains("AI") }.count
+            var summary = "Re-categorized \(results.count) emails "
+                + "using \(contacts.count) contacts."
+            if usingAI {
+                let verdicts = (try? await database.cachedVerdictCount(
+                    accountId: accountId,
+                    modelId: settings?.aiConfig.modelId.isEmpty == false
+                        ? settings!.aiConfig.modelId
+                        : BedrockLLMTransport.defaultModelId,
+                    promptVersion: SenderClassificationPrompt.version
+                )) ?? 0
+                summary += " Cloud verdicts cached: \(verdicts). "
+                    + "Decisions citing the model: \(aiInfluenced)."
+            }
+            maintenanceStatus = summary
         } catch {
-            print("Recategorization failed: \(error)")
+            maintenanceStatus = "Re-categorization failed: \(error.localizedDescription)"
         }
     }
 
