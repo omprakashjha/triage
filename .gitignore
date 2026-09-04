@@ -17,7 +17,10 @@ build/
 # SPM
 .build/
 .swiftpm/
-Package.resolved
+# Package.resolved IS committed: Package.swift pins only the 3 direct
+# dependencies, while aws-sdk-swift pulls ~26 transitive ones whose versions
+# are recorded nowhere else. Without this file two machines can resolve
+# different SwiftNIO/Smithy versions.
 
 # macOS
 .DS_Store

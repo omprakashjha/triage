@@ -14,7 +14,18 @@ struct ContentView: View {
             } else if appState.accounts.isEmpty {
                 WelcomeView()
             } else {
-                InboxOverviewView()
+                switch appState.detailRoute {
+                case .overview:
+                    InboxOverviewView()
+                case .senders:
+                    SenderTriageView()
+                case .history:
+                    HistoryView()
+                case .evaluation:
+                    EvaluationView()
+                case .settings:
+                    SettingsView()
+                }
             }
         }
         .task {
@@ -45,6 +56,34 @@ struct SidebarView: View {
                 }
             }
 
+            Section("Views") {
+                SidebarRouteRow(
+                    title: "Inbox Overview",
+                    systemImage: "tray.2",
+                    route: .overview
+                )
+                SidebarRouteRow(
+                    title: "Senders",
+                    systemImage: "person.2.badge.gearshape",
+                    route: .senders
+                )
+                SidebarRouteRow(
+                    title: "History",
+                    systemImage: "clock.arrow.circlepath",
+                    route: .history
+                )
+                SidebarRouteRow(
+                    title: "Accuracy",
+                    systemImage: "chart.bar.doc.horizontal",
+                    route: .evaluation
+                )
+                SidebarRouteRow(
+                    title: "Settings",
+                    systemImage: "gearshape",
+                    route: .settings
+                )
+            }
+
             Section {
                 NavigationLink {
                     AddAccountView()
@@ -65,6 +104,33 @@ struct SidebarView: View {
         } message: {
             Text("This will remove the account and all its local data. Your emails on Gmail won't be affected.")
         }
+    }
+}
+
+/// A sidebar entry that switches the detail column.
+///
+/// Not a `NavigationLink` because the detail route is a separate axis from the
+/// sidebar's account selection — a link would push into the sidebar column instead.
+struct SidebarRouteRow: View {
+    @EnvironmentObject private var appState: AppState
+
+    let title: String
+    let systemImage: String
+    let route: AppState.DetailRoute
+
+    var body: some View {
+        Button {
+            appState.detailRoute = route
+        } label: {
+            HStack {
+                Label(title, systemImage: systemImage)
+                Spacer()
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(appState.detailRoute == route ? Color.accentColor : Color.primary)
+        .fontWeight(appState.detailRoute == route ? .semibold : .regular)
     }
 }
 

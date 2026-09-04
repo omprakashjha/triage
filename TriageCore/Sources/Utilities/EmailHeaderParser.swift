@@ -64,6 +64,42 @@ public enum EmailHeaderParser {
         return options
     }
 
+    /// Parse an address-list header (`To`, `Cc`) into individual email addresses.
+    ///
+    /// Splits on commas that are outside quoted display names and outside angle
+    /// brackets, so `"Doe, John" <j@x.com>, a@b.com` yields two addresses rather
+    /// than three fragments.
+    public static func parseAddressList(_ header: String) -> [String] {
+        var fields: [String] = []
+        var current = ""
+        var inQuotes = false
+        var inAngles = false
+
+        for character in header {
+            switch character {
+            case "\"":
+                inQuotes.toggle()
+                current.append(character)
+            case "<" where !inQuotes:
+                inAngles = true
+                current.append(character)
+            case ">" where !inQuotes:
+                inAngles = false
+                current.append(character)
+            case "," where !inQuotes && !inAngles:
+                fields.append(current)
+                current = ""
+            default:
+                current.append(character)
+            }
+        }
+        fields.append(current)
+
+        return fields
+            .map { parseSender($0).email }
+            .filter { $0.contains("@") && !$0.hasPrefix("@") && !$0.hasSuffix("@") }
+    }
+
     /// Extract domain from email address
     public static func extractDomain(_ email: String) -> String {
         let parts = email.lowercased().components(separatedBy: "@")

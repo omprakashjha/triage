@@ -18,7 +18,8 @@ public actor GmailService {
     public func fetchAllMetadata(
         accountId: Int64,
         lastHistoryId: String? = nil,
-        incremental: Bool = true
+        incremental: Bool = true,
+        scope: ScanScope = .unreadOnly
     ) -> AsyncThrowingStream<ScanProgress, Error> {
         AsyncThrowingStream { continuation in
             Task {
@@ -27,11 +28,13 @@ public actor GmailService {
                         try await self.performIncrementalSync(
                             accountId: accountId,
                             historyId: historyId,
+                            scope: scope,
                             continuation: continuation
                         )
                     } else {
                         try await self.performFullSync(
                             accountId: accountId,
+                            scope: scope,
                             continuation: continuation
                         )
                     }
@@ -51,12 +54,13 @@ public actor GmailService {
 
     private func performFullSync(
         accountId: Int64,
+        scope: ScanScope,
         continuation: AsyncThrowingStream<ScanProgress, Error>.Continuation
     ) async throws {
         // Step 1: Get all message IDs
         continuation.yield(ScanProgress(total: 0, fetched: 0, status: .fetchingList))
 
-        let messageIds = try await client.listAllMessageIds(query: "is:unread")
+        let messageIds = try await client.listAllMessageIds(query: scope.gmailQuery)
         let total = messageIds.count
 
         if total == 0 {
@@ -102,6 +106,7 @@ public actor GmailService {
     private func performIncrementalSync(
         accountId: Int64,
         historyId: String,
+        scope: ScanScope,
         continuation: AsyncThrowingStream<ScanProgress, Error>.Continuation
     ) async throws {
         continuation.yield(ScanProgress(total: 0, fetched: 0, status: .fetchingList))
@@ -153,8 +158,16 @@ public actor GmailService {
             let batchStream = client.batchGetMessages(ids: ids)
 
             for try await batch in batchStream {
+                // The History API returns every added message regardless of the query
+                // used for the full sync, so the scope filter has to be re-applied here
+                // or the local database drifts out of agreement with itself.
                 let emails = batch.compactMap { message -> EmailMetadata? in
-                    self.convertToMetadata(message: message, accountId: accountId)
+                    guard scope.includes(
+                        labelIds: message.labelIds,
+                        isUnread: message.isUnread,
+                        date: message.parsedDate ?? Date()
+                    ) else { return nil }
+                    return self.convertToMetadata(message: message, accountId: accountId)
                 }
 
                 try await database.batchUpsertEmails(emails)
@@ -179,10 +192,54 @@ public actor GmailService {
         } catch let error as APIError {
             // If historyId is too old (404), fall back to full sync
             if case .httpError(statusCode: 404, _) = error {
-                try await performFullSync(accountId: accountId, continuation: continuation)
+                try await performFullSync(accountId: accountId, scope: scope, continuation: continuation)
             } else {
                 throw error
             }
+        }
+    }
+
+    // MARK: - Contact Detection
+
+    /// Build a contact list from the user's own SENT mail.
+    ///
+    /// Anyone the user has written to is a real correspondent — this is the strongest
+    /// signal available for the protected tier, and far more reliable than guessing
+    /// from inbound patterns. Capped because a long-lived mailbox can hold tens of
+    /// thousands of sent messages and the contact set saturates quickly.
+    ///
+    /// `ownAddress` is excluded: the user is not their own contact, and self-addressed
+    /// mail (notes-to-self, mailing list echoes) would otherwise dominate the counts.
+    public func fetchSentMailContacts(
+        accountId: Int64,
+        ownAddress: String,
+        maxMessages: Int = 2000
+    ) async throws -> [KnownContact] {
+        let ids = try await client.listAllMessageIds(query: "in:sent")
+        guard !ids.isEmpty else { return [] }
+
+        let capped = Array(ids.prefix(maxMessages))
+        let own = ownAddress.lowercased()
+
+        var counts: [String: Int] = [:]
+        let stream = client.batchGetMessages(ids: capped)
+        for try await batch in stream {
+            for message in batch {
+                for address in message.recipientAddresses {
+                    let normalized = address.lowercased()
+                    guard normalized != own, normalized.contains("@") else { continue }
+                    counts[normalized, default: 0] += 1
+                }
+            }
+        }
+
+        return counts.map { email, count in
+            KnownContact(
+                accountId: accountId,
+                email: email,
+                source: .sentMail,
+                occurrences: count
+            )
         }
     }
 
@@ -205,6 +262,7 @@ public actor GmailService {
             snippet: message.snippet,
             hasListUnsubscribe: listUnsubscribe != nil,
             listUnsubscribeHeader: listUnsubscribe,
+            supportsOneClickUnsubscribe: message.supportsOneClickUnsubscribe,
             replyTo: message.replyTo,
             labels: message.labelIds,
             isUnread: message.isUnread

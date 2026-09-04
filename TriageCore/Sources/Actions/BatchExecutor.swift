@@ -84,6 +84,11 @@ public actor BatchExecutor {
                             Array(messageIds[$0..<min($0 + batchSize, messageIds.count)])
                         }
 
+                        // Track what actually landed. Logging the whole item up front
+                        // would claim ids as executed even when the run was cancelled
+                        // partway, making undo try to reverse work that never happened.
+                        var executedIds: [String] = []
+
                         for batch in batches {
                             guard !self.isCancelled else { break }
 
@@ -106,23 +111,27 @@ public actor BatchExecutor {
                                 )
                             }
 
+                            executedIds.append(contentsOf: batch)
                             completed += batch.count
                         }
+
+                        guard !executedIds.isEmpty else { continue }
 
                         // Log the action for undo
                         var actionLog = ActionLog(
                             accountId: plan.accountId,
                             action: item.action,
-                            messageIds: messageIds,
-                            messageCount: messageIds.count,
+                            messageIds: executedIds,
+                            messageCount: executedIds.count,
                             isReversible: true,
-                            description: "\(item.action == .archived ? "Archived" : "Deleted") \(messageIds.count) \(item.category.displayName) emails"
+                            description: "\(item.action == .archived ? "Archived" : "Deleted") \(executedIds.count) \(item.category.displayName) emails"
                         )
                         try await self.database.logAction(&actionLog)
 
-                        // Update email records in database
-                        try await self.database.markEmailsActioned(
-                            messageIds: messageIds,
+                        // Record as executed (not merely marked), so it leaves the
+                        // working views while staying available for undo.
+                        try await self.database.markEmailsExecuted(
+                            messageIds: executedIds,
                             accountId: plan.accountId,
                             action: item.action
                         )
@@ -193,8 +202,12 @@ public actor BatchExecutor {
 // MARK: - Undo
 
 extension BatchExecutor {
-    /// Undo the most recent action
-    public func undoLastAction() async throws -> ActionLog? {
+    /// Undo the most recent reversible action.
+    ///
+    /// `provider` is REQUIRED: it previously defaulted to `.gmail`, so undoing a Yahoo
+    /// action silently took the Gmail branch and failed (or worse, addressed the wrong
+    /// account's API).
+    public func undoLastAction(provider: EmailProvider) async throws -> ActionLog? {
         let recentActions = try await database.fetchRecentActions(limit: 1)
         guard let lastAction = recentActions.first,
               lastAction.isReversible,
@@ -202,14 +215,13 @@ extension BatchExecutor {
             return nil
         }
 
-        try await reverseAction(lastAction)
+        try await reverseAction(lastAction, provider: provider)
         return lastAction
     }
 
     /// Undo a specific action by ID
     public func undoAction(actionId: Int64, provider: EmailProvider) async throws {
-        let actions = try await database.fetchRecentActions(limit: 100)
-        guard let action = actions.first(where: { $0.id == actionId }),
+        guard let action = try await database.fetchAction(id: actionId),
               action.isReversible,
               !action.isReversed else {
             throw ExecutionError.cannotUndo("Action not found or not reversible")
@@ -218,7 +230,7 @@ extension BatchExecutor {
         try await reverseAction(action, provider: provider)
     }
 
-    private func reverseAction(_ action: ActionLog, provider: EmailProvider = .gmail) async throws {
+    private func reverseAction(_ action: ActionLog, provider: EmailProvider) async throws {
         let messageIds = action.messageIds
 
         switch (provider, action.action) {

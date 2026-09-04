@@ -47,8 +47,29 @@ struct CategoryBreakdownView: View {
                     Label("\(stats.totalEmails) total", systemImage: "envelope")
                     Label("\(stats.safeToAction) safe", systemImage: "checkmark.shield")
                         .foregroundStyle(.green)
+                    Label("\(stats.protected_) protected", systemImage: "lock.shield")
+                        .foregroundStyle(.blue)
                 }
                 .font(.caption)
+
+                // Contact detection is what makes the protected tier possible at all.
+                // Calling that out explicitly, because a silent zero here means nothing
+                // in the mailbox is shielded from the action plan.
+                if appState.knownContactCount == 0 {
+                    Label(
+                        "No contacts detected — nothing is protected. Rescan to build your contact list.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+                } else {
+                    Label(
+                        "\(appState.knownContactCount) known contacts protected",
+                        systemImage: "person.crop.circle.badge.checkmark"
+                    )
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                }
             }
             .padding()
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -179,6 +200,35 @@ struct TierRow: View {
     }
 }
 
+// MARK: - Confidence Badge
+
+/// Renders the engine's own confidence in a decision.
+///
+/// Deliberately shown rather than hidden: the confidence values drive the review
+/// ordering, and a user who can see "45%" next to a delete recommendation is far
+/// better placed to catch a bad call than one shown only the category.
+struct ConfidenceBadge: View {
+    let confidence: Double
+
+    var body: some View {
+        Text("\(Int((confidence * 100).rounded()))% confident")
+            .font(.caption2)
+            .padding(.horizontal, 5)
+            .padding(.vertical, 1)
+            .background(
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(tint.opacity(0.15))
+            )
+            .foregroundStyle(tint)
+    }
+
+    private var tint: Color {
+        if confidence >= 0.8 { return .green }
+        if confidence >= 0.6 { return .orange }
+        return .red
+    }
+}
+
 // MARK: - Email List View
 
 struct EmailListView: View {
@@ -237,6 +287,22 @@ struct EmailListView: View {
                             .font(.caption)
                     }
                     .width(80)
+
+                    // The engine already computes a justification and a confidence for
+                    // every decision; showing them is what lets a user tell a good
+                    // call from a bad one before approving anything.
+                    TableColumn("Why") { email in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(email.categoryReason ?? "—")
+                                .font(.caption2)
+                                .lineLimit(2)
+                                .foregroundStyle(.secondary)
+                            if let confidence = email.categoryConfidence {
+                                ConfidenceBadge(confidence: confidence)
+                            }
+                        }
+                    }
+                    .width(min: 140, ideal: 200)
 
                     TableColumn("Actions") { email in
                         Button("Find Similar") {
@@ -335,6 +401,19 @@ struct TierEmailListView: View {
                             .font(.caption)
                     }
                     .width(80)
+
+                    TableColumn("Why") { email in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(email.categoryReason ?? "—")
+                                .font(.caption2)
+                                .lineLimit(2)
+                                .foregroundStyle(.secondary)
+                            if let confidence = email.categoryConfidence {
+                                ConfidenceBadge(confidence: confidence)
+                            }
+                        }
+                    }
+                    .width(min: 140, ideal: 220)
                 }
             }
         }
@@ -356,7 +435,13 @@ struct TierEmailListView: View {
         defer { isLoading = false }
         guard let account = appState.selectedAccount, let accountId = account.id else { return }
         do {
-            emails = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
+            // The review tier is a work queue, so order it weakest-confidence first.
+            // Other tiers are reference lists and stay newest-first.
+            if tier == .review {
+                emails = try await appState.fetchEmailsForReview(accountId: accountId)
+            } else {
+                emails = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
+            }
         } catch {
             print("Failed to load emails by tier: \(error)")
         }

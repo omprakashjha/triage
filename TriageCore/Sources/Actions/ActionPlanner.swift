@@ -103,7 +103,7 @@ public struct ActionPlanSummary: Sendable {
 // MARK: - Action Rules
 
 /// Configurable rules that determine what action to take per category
-public struct ActionRules: Codable, Sendable {
+public struct ActionRules: Codable, Sendable, Equatable {
     public var newsletterAction: EmailAction
     public var newsletterMaxAgeDays: Int?
 
@@ -233,12 +233,19 @@ public struct ActionPlanner: Sendable {
                 )
             }
 
+            // Auto-approval must follow the SAFETY TIER, not just the category.
+            // Previously `isApproved = category != .unknown` discarded the tier the
+            // engine had computed, so mail explicitly marked .review (a receipt at 0.65
+            // confidence, an ambiguous info@ sender) landed pre-approved for deletion.
+            let allSafe = eligibleEmails.allSatisfy { $0.safetyTier == .safe }
+            let autoApprove = allSafe && category != .unknown
+
             let item = ActionPlanItem(
                 id: "\(category.rawValue)_\(action.rawValue)",
                 category: category,
                 action: action,
                 entries: entries,
-                isApproved: category != .unknown,  // Auto-approve safe categories, not unknown
+                isApproved: autoApprove,
                 ageFilter: maxAgeDays,
                 reason: buildReason(category: category, action: action, ageDays: maxAgeDays)
             )
