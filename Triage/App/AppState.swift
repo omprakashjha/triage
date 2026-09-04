@@ -179,6 +179,16 @@ final class AppState: ObservableObject {
                 sentMailContacts: sentContacts
             )
             knownContactCount = contacts.count
+
+            // Succeeding with nothing is its own problem and must not pass silently:
+            // an empty contact set means the protected tier is empty, which is the
+            // condition the whole safety model depends on NOT being true.
+            if contacts.isEmpty {
+                contactDetectionWarning = "No contacts found. Searched \(account.email)'s "
+                    + "sent mail (\(sentContacts.count) correspondents) and Gmail's own "
+                    + "personal-mail labels, and both came back empty. Pin senders by hand "
+                    + "from the Senders view until this is resolved."
+            }
         } catch {
             // Fall back to whatever was persisted previously rather than an empty set.
             //

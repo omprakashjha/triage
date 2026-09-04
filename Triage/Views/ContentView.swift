@@ -32,6 +32,17 @@ struct ContentView: View {
                         )
                     }
 
+                    // Contact detection failing is narrower than a scan failing, but it
+                    // was being written to a property nothing rendered — the same
+                    // invisible-error mistake as the scan banner. Shown separately and
+                    // less alarmingly, because the consequence is specific: fewer
+                    // contacts means less mail is protected.
+                    if let warning = appState.contactDetectionWarning {
+                        ContactWarningBanner(message: warning) {
+                            appState.contactDetectionWarning = nil
+                        }
+                    }
+
                     switch appState.detailRoute {
                     case .overview:
                         InboxOverviewView()
@@ -238,6 +249,41 @@ struct ScanFailureBanner: View {
         }
         .padding(10)
         .background(Color.orange.opacity(0.12))
+    }
+}
+
+/// Contact detection problems, which weaken the protected tier without breaking a scan.
+struct ContactWarningBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .foregroundStyle(.yellow)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Contacts not detected")
+                    .fontWeight(.semibold)
+                    .font(.callout)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Nothing is in the Protected tier until contacts exist, so do not execute a delete plan yet.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            Spacer()
+
+            Button("Dismiss", action: onDismiss)
+                .buttonStyle(.borderless)
+                .font(.caption)
+        }
+        .padding(10)
+        .background(Color.yellow.opacity(0.12))
     }
 }
 
