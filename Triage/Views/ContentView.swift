@@ -22,9 +22,14 @@ struct ContentView: View {
                     // invisibly is indistinguishable from a scan that does nothing.
                     if let progress = appState.scanProgress,
                        case .failed(let message) = progress.status {
-                        ScanFailureBanner(message: message) {
-                            appState.scanProgress = nil
-                        }
+                        ScanFailureBanner(
+                            message: message,
+                            isReconnecting: appState.isReconnecting,
+                            onReconnect: appState.selectedAccount.map { account in
+                                { Task { await appState.reconnectAccount(account) } }
+                            },
+                            onDismiss: { appState.scanProgress = nil }
+                        )
                     }
 
                     switch appState.detailRoute {
@@ -60,6 +65,14 @@ struct SidebarView: View {
                     Label(account.email, systemImage: account.provider.iconName)
                         .tag(account)
                         .contextMenu {
+                            Button {
+                                Task { await appState.reconnectAccount(account) }
+                            } label: {
+                                Label("Reconnect…", systemImage: "arrow.triangle.2.circlepath")
+                            }
+
+                            Divider()
+
                             Button(role: .destructive) {
                                 accountToDelete = account
                                 showDeleteConfirmation = true
@@ -116,7 +129,10 @@ struct SidebarView: View {
                 }
             }
         } message: {
-            Text("This will remove the account and all its local data. Your emails on Gmail won't be affected.")
+            // Spell out the actual consequence: emailMetadata cascades on the account
+            // row, so this discards every scanned message and a rescan has to refetch
+            // them all. Anyone here because of an expired token wants Reconnect instead.
+            Text("This deletes the account AND every email already scanned for it — a rescan would have to fetch them all again. Your mail on Gmail is not affected.\n\nIf you are only fixing an expired login, use “Reconnect…” instead: it keeps the scanned mail.")
         }
     }
 }
@@ -127,7 +143,16 @@ struct SidebarView: View {
 /// provider's own message, and it needs to be copyable to be actionable.
 struct ScanFailureBanner: View {
     let message: String
+    let isReconnecting: Bool
+    let onReconnect: (() -> Void)?
     let onDismiss: () -> Void
+
+    /// Whether this failure is a credential problem, which is the one case the user can
+    /// fix from here rather than by reading the message.
+    private var looksLikeAuthFailure: Bool {
+        ["invalid_grant", "token", "auth", "credential", "401", "unauthor"]
+            .contains { message.localizedCaseInsensitiveContains($0) }
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 8) {
@@ -146,10 +171,8 @@ struct ScanFailureBanner: View {
                 // The overwhelmingly common cause, stated where it is useful rather
                 // than left for the user to work out: Google expires refresh tokens
                 // after 7 days while the OAuth consent screen is in testing mode.
-                if message.localizedCaseInsensitiveContains("invalid_grant")
-                    || message.localizedCaseInsensitiveContains("token")
-                    || message.localizedCaseInsensitiveContains("auth") {
-                    Text("If this account was connected more than a week ago, the refresh token has probably expired — Google expires them after 7 days while the OAuth consent screen is in testing mode. Remove the account from the sidebar and reconnect it.")
+                if looksLikeAuthFailure {
+                    Text("Google expires refresh tokens after 7 days while the OAuth consent screen is in testing mode, so an account connected more than a week ago stops working. Reconnect keeps every email already scanned — unlike removing the account, which deletes them.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -159,9 +182,24 @@ struct ScanFailureBanner: View {
 
             Spacer()
 
-            Button("Dismiss", action: onDismiss)
-                .buttonStyle(.borderless)
-                .font(.caption)
+            VStack(spacing: 6) {
+                if looksLikeAuthFailure, let onReconnect {
+                    Button(action: onReconnect) {
+                        if isReconnecting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Reconnect…")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isReconnecting)
+                }
+
+                Button("Dismiss", action: onDismiss)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+            }
         }
         .padding(10)
         .background(Color.orange.opacity(0.12))

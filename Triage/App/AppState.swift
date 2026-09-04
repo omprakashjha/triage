@@ -46,6 +46,7 @@ final class AppState: ObservableObject {
     /// count in the UI is zero too.
     @Published var knownContactCount = 0
     @Published var isRefreshingContacts = false
+    @Published var isReconnecting = false
     /// Contact detection failing is a narrower problem than the scan failing, and is
     /// reported separately so the two are not confused.
     @Published var contactDetectionWarning: String?
@@ -253,6 +254,53 @@ final class AppState: ObservableObject {
             actionPlan = planner.generatePlan(emails: emails, accountId: accountId)
         } catch {
             print("Plan generation failed: \(error)")
+        }
+    }
+
+    /// Re-run OAuth for an account that already exists, WITHOUT touching its data.
+    ///
+    /// Necessary because Google expires refresh tokens after 7 days while the OAuth
+    /// consent screen is in testing mode, so an account stops working periodically and
+    /// needs fresh consent.
+    ///
+    /// The obvious workaround — remove the account and add it again — is destructive and
+    /// does not even work: `deleteAccount` cascades to `emailMetadata` and would discard
+    /// every scanned message, and re-adding then fails on the UNIQUE constraint on
+    /// `email`. This path keeps the row and its mail and only replaces the credentials.
+    @MainActor
+    func reconnectAccount(_ account: EmailAccount) async {
+        isReconnecting = true
+        lastExecutionError = nil
+        defer { isReconnecting = false }
+
+        do {
+            let tokens = try await authService.authenticate()
+
+            // Verify the Google account that just signed in is the one being repaired.
+            // Without this, signing in as the wrong account silently stores a token that
+            // does not match the row, and the next scan reads someone else's mailbox.
+            let rateLimiter = RateLimiter(maxRequestsPerSecond: 45)
+            let client = GmailAPIClient(
+                tokens: tokens,
+                rateLimiter: rateLimiter,
+                retryPolicy: RetryPolicy()
+            )
+            let profile = try await client.getProfile()
+
+            guard profile.emailAddress.lowercased() == account.email.lowercased() else {
+                lastExecutionError = "You signed in as \(profile.emailAddress), but this "
+                    + "account is \(account.email). Nothing was changed — reconnect again "
+                    + "and choose \(account.email)."
+                try? authService.signOut()
+                return
+            }
+
+            configureGmail(with: tokens)
+            selectedAccount = account
+            // Clear the stale failure so the banner does not outlive the problem.
+            scanProgress = nil
+        } catch {
+            lastExecutionError = "Reconnect failed: \(error.localizedDescription)"
         }
     }
 
