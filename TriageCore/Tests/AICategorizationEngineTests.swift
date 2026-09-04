@@ -59,10 +59,10 @@ final class AICategorizationEngineTests: XCTestCase {
 
     // MARK: - The safety guarantee
 
-    func testAIVerdictCannotLoosenSafety() {
-        // Rules said this needs review. The model disagrees and says it is disposable.
-        // Safety must NOT be loosened — a hallucinated verdict must cost at most one
-        // manual review, never a deleted receipt.
+    func testAIVerdictAloneCannotLoosenSafety() {
+        // Rules were unsure. The model says disposable. That is NOT enough to authorise
+        // deletion: no single fallible source is, and a hallucinated verdict must cost at
+        // most one manual review, never a deleted receipt.
         let ruleResult = CategorizationResult(
             messageId: "m", category: .transactional, safetyTier: .review,
             confidence: 0.5, reason: "rules: ambiguous"
@@ -71,7 +71,111 @@ final class AICategorizationEngineTests: XCTestCase {
 
         let merged = AICategorizationEngine.merge(rule: ruleResult, verdict: modelSaysSafe)
 
-        XCTAssertEqual(merged.safetyTier, .review, "the model must never move mail toward deletion")
+        XCTAssertEqual(
+            merged.safetyTier, .review,
+            "one model call must not move mail toward deletion on its own"
+        )
+    }
+
+    func testAIVerdictCannotLoosenAStrongRuleFindingEvenWithCorroboration() {
+        // A finding the rules EARNED is never loosened, whatever else agrees. An explicit
+        // transactional domain match outranks both the model and the provider.
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .transactional, safetyTier: .review,
+            confidence: 0.9, reason: "Transactional sender", evidence: .strong
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("x@shop.com", category: .promotion, mustKeep: false),
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(merged.safetyTier, .review)
+        XCTAssertEqual(merged.category, .transactional, "a strong rule keeps its category")
+    }
+
+    func testCorroboratedVerdictMayResolveAProvisionalFinding() {
+        // Two unrelated classifiers agree the mail is bulk marketing, and one of them read
+        // the message. That is enough. Without this the app was inert: the evidence
+        // invariant parked every weak finding in review, leaving 1 of 403 emails
+        // actionable — including 104 the model had correctly called marketing.
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .unknown, safetyTier: .review,
+            confidence: 0.4, reason: "No matching rule"
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("x@shop.com", category: .promotion, mustKeep: false),
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(merged.safetyTier, .safe)
+        XCTAssertEqual(merged.category, .promotion)
+        XCTAssertTrue(merged.reason.contains("Gmail"))
+    }
+
+    func testProviderDisagreementKeepsProvisionalMailInReview() {
+        // Same verdict, but the provider filed this message under Updates — where bills
+        // live. The disagreement is decided per MESSAGE, which is how a mixed sender like
+        // info@email.ns.nl (46 promotional, 58 receipts) gets split correctly.
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .unknown, safetyTier: .review,
+            confidence: 0.4, reason: "No matching rule"
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("info@email.ns.nl", category: .promotion, mustKeep: false),
+            providerCategory: .updates
+        )
+
+        XCTAssertEqual(merged.safetyTier, .review)
+    }
+
+    func testVerdictMayAlwaysRaiseSafetyWithoutCorroboration() {
+        // Raising safety needs no second opinion — the asymmetry is the whole point. Note
+        // the provider says PROMOTIONS here and is simply outvoted: corroboration is a
+        // requirement for loosening, never a licence to loosen.
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .promotion, safetyTier: .review,
+            confidence: 0.5, reason: "weak guess"
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("colleague@example.com", category: .personal, isRealPerson: true),
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(merged.safetyTier, .protected_)
+        XCTAssertTrue(merged.reason.contains("raised safety"))
+    }
+
+    func testVerdictNarrowsEvenAStrongRuleFinding() {
+        // Narrowing a strong finding is still allowed — only loosening is restricted.
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .promotion, safetyTier: .safe,
+            confidence: 0.85, reason: "Known promotional sender domain", evidence: .strong
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("x@shop.com", category: .transactional, mustKeep: true)
+        )
+
+        XCTAssertEqual(merged.safetyTier, .review, "the model may always argue for keeping")
+    }
+
+    func testVerdictNeverWeakensAProtectedContact() {
+        let ruleResult = CategorizationResult(
+            messageId: "m", category: .personal, safetyTier: .protected_,
+            confidence: 0.95, reason: "From known contact", evidence: .strong
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: ruleResult,
+            verdict: verdict("friend@example.com", category: .promotion, mustKeep: false),
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(merged.safetyTier, .protected_)
+        XCTAssertEqual(merged.reason, "From known contact")
     }
 
     func testAIVerdictCanRaiseSafety() {

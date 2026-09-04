@@ -138,7 +138,15 @@ public final class AICategorizationEngine: CategorizationEngine {
         for email in emails {
             guard let ruleResult = resultsById[email.messageId] else { continue }
             guard let verdict = verdicts[email.senderEmail.lowercased()] else { continue }
-            resultsById[email.messageId] = Self.merge(rule: ruleResult, verdict: verdict)
+            resultsById[email.messageId] = Self.merge(
+                rule: ruleResult,
+                verdict: verdict,
+                // Per-MESSAGE, which is what lets a mixed sender be split correctly:
+                // info@email.ns.nl is 46 promotional and 58 receipts, and one sender-level
+                // verdict cannot be right for both. The provider labelled each message
+                // individually, so corroboration is decided message by message.
+                providerCategory: email.providerCategory
+            )
             diagnostics.mergesApplied += 1
         }
 
@@ -219,24 +227,56 @@ public final class AICategorizationEngine: CategorizationEngine {
     /// The tier is `max(ruleTier, verdictTier)` on the strictness ordering. So the model
     /// can promote mail to review or protected on its own authority, but moving mail
     /// toward deletion requires the rules to already agree it is safe.
-    static func merge(rule: CategorizationResult, verdict: SenderVerdict) -> CategorizationResult {
+    static func merge(
+        rule: CategorizationResult,
+        verdict: SenderVerdict,
+        providerCategory: ProviderCategory? = nil
+    ) -> CategorizationResult {
+        // A contact outranks any verdict, and nothing here may weaken that.
+        guard rule.safetyTier != .protected_ else { return rule }
+
         let ruleRank = strictness(rule.safetyTier)
         let verdictRank = strictness(verdict.impliedTier)
-        let finalTier = verdictRank > ruleRank ? verdict.impliedTier : rule.safetyTier
 
-        // The model's category wins whenever the rule's own evidence was weak — which is
-        // the only situation the model is consulted in. A read of the actual subject line
-        // beats an English keyword match or a `noreply@` prefix, and on a non-English
-        // mailbox it beats them decisively.
+        // Narrowing-only applies to findings the rules actually EARNED. A weak finding is
+        // provisional — the invariant parked it in review because the rules did not know —
+        // so a verdict may resolve it in either direction.
+        //
+        // But a verdict alone may not authorise DELETION. The principle is that no single
+        // fallible source gets to do that: an explicit domain list may, because it is
+        // near-certain and language-independent; one model call may not, because a
+        // hallucinated "disposable" would cost a real receipt. So loosening requires the
+        // provider to independently agree the mail is bulk marketing — two unrelated
+        // classifiers reaching the same conclusion, one of which read the message.
+        //
+        // Both failure modes here have already happened. Applying narrowing to provisional
+        // findings froze the whole mailbox in review (1 of 403 actionable, including 104
+        // the model had correctly called marketing). Letting the model loosen freely is
+        // what the test guarding this line was written to prevent.
+        let finalTier: SafetyTier
+        if rule.evidence.canAutoAction {
+            finalTier = verdictRank > ruleRank ? verdict.impliedTier : rule.safetyTier
+        } else if verdictRank > ruleRank {
+            // Raising safety never needs a second opinion.
+            finalTier = verdict.impliedTier
+        } else if verdict.impliedTier == .safe && providerCategory?.isBulkMarketing == true {
+            finalTier = .safe
+        } else {
+            finalTier = rule.safetyTier
+        }
+
         let useVerdictCategory = !rule.evidence.canAutoAction
         let finalCategory = useVerdictCategory ? verdict.category : rule.category
 
-        let reason = useVerdictCategory
-            ? "AI: \(verdict.reason)"
-            : rule.reason
-        let tierNote = finalTier != rule.safetyTier && finalTier == verdict.impliedTier
-            ? " (AI raised safety)"
-            : ""
+        let reason = useVerdictCategory ? "AI: \(verdict.reason)" : rule.reason
+        let tierNote: String
+        if finalTier != rule.safetyTier && verdictRank > ruleRank {
+            tierNote = " (AI raised safety)"
+        } else if finalTier == .safe && rule.safetyTier != .safe {
+            tierNote = " (AI and Gmail agree it is bulk marketing)"
+        } else {
+            tierNote = ""
+        }
 
         return CategorizationResult(
             messageId: rule.messageId,
@@ -244,8 +284,8 @@ public final class AICategorizationEngine: CategorizationEngine {
             safetyTier: finalTier,
             confidence: useVerdictCategory ? verdict.confidence : rule.confidence,
             reason: reason + tierNote,
-            // A model verdict counts as strong evidence: something actually read the
-            // mail, rather than pattern-matching its envelope.
+            // A verdict counts as strong evidence: something read the mail, rather than
+            // pattern-matching its envelope.
             evidence: useVerdictCategory ? .strong : rule.evidence
         )
     }
