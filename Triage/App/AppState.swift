@@ -52,6 +52,10 @@ final class AppState: ObservableObject {
     @Published var maintenanceStatus: String?
     /// What the last AI pass actually did, counted rather than inferred.
     @Published var aiDiagnostics: String?
+    /// The user's own corrections for the selected account, kept in memory because every
+    /// categorization pass consults them.
+    @Published var corrections: [UserCorrection] = []
+    @Published var correctionStatus: String?
     /// Contact detection failing is a narrower problem than the scan failing, and is
     /// reported separately so the two are not confused.
     @Published var contactDetectionWarning: String?
@@ -638,6 +642,106 @@ final class AppState: ObservableObject {
         sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
     }
 
+    // MARK: - Corrections
+
+    func loadCorrections(accountId: Int64) async {
+        do {
+            corrections = try await database.corrections(accountId: accountId)
+        } catch {
+            corrections = []
+            correctionStatus = "Could not load corrections: \(error.localizedDescription)"
+        }
+    }
+
+    /// Record that the app got a categorization wrong, and act on it immediately.
+    ///
+    /// Re-categorizes only the affected sender rather than the whole mailbox. A correction
+    /// has to visibly take effect at once: making the user wait through a full pass to see
+    /// their own instruction applied is how a feature like this stops being used.
+    func correctCategory(
+        for email: EmailMetadata,
+        to category: EmailCategory,
+        mustKeep: Bool,
+        scopeToSubjectPattern pattern: String? = nil
+    ) async {
+        let accountId = email.accountId
+
+        let correction = UserCorrection(
+            accountId: accountId,
+            senderEmail: email.senderEmail,
+            subjectPattern: pattern,
+            category: category,
+            mustKeep: mustKeep,
+            previousCategory: email.category,
+            previousTier: email.safetyTier,
+            previousReason: email.categoryReason
+        )
+
+        do {
+            try await database.saveCorrection(correction)
+            await loadCorrections(accountId: accountId)
+            let affected = try await recategorizeSender(
+                accountId: accountId,
+                senderEmail: email.senderEmail
+            )
+
+            var scope = email.senderEmail
+            if let pattern {
+                scope += " (subjects containing \"\(pattern)\")"
+            }
+            correctionStatus = "Set \(scope) to \(category.displayName)"
+                + (mustKeep ? ", protected" : "")
+                + " — \(affected) message\(affected == 1 ? "" : "s") updated."
+            // Sender rows carry the tier counts a correction changes, so they would
+            // otherwise show stale numbers until the next manual refresh.
+            await loadSenderSummaries(accountId: accountId)
+        } catch {
+            correctionStatus = "Could not save the correction: \(error.localizedDescription)"
+        }
+    }
+
+    /// Apply the current correction set to one sender's existing mail.
+    @discardableResult
+    private func recategorizeSender(accountId: Int64, senderEmail: String) async throws -> Int {
+        let emails = try await database.emails(accountId: accountId, senderEmail: senderEmail)
+        guard !emails.isEmpty else { return 0 }
+
+        let contacts = try await database.knownContactEmails(accountId: accountId)
+        let engine = makeEngine(accountId: accountId, contacts: contacts)
+        let results = try await engine.categorize(emails: emails)
+        try await database.updateCategories(results, accountId: accountId)
+        return results.count
+    }
+
+    /// Turn corrections into golden labels, so accuracy becomes measurable from ordinary
+    /// use rather than a separate labelling chore.
+    func promoteCorrectionsToLabels(accountId: Int64) async {
+        do {
+            let written = try await database.promoteCorrectionsToGoldenLabels(accountId: accountId)
+            await loadGoldenLabels(accountId: accountId)
+            correctionStatus = written == 0
+                ? "No sender-wide corrections to add. Subject-scoped ones can't become labels, since the evaluation set is keyed by sender."
+                : "Added \(written) correction\(written == 1 ? "" : "s") to the evaluation set."
+        } catch {
+            correctionStatus = "Could not update the evaluation set: \(error.localizedDescription)"
+        }
+    }
+
+    func removeCorrection(_ correction: UserCorrection) async {        guard let id = correction.id else { return }
+        do {
+            try await database.deleteCorrection(id: id)
+            await loadCorrections(accountId: correction.accountId)
+            let affected = try await recategorizeSender(
+                accountId: correction.accountId,
+                senderEmail: correction.senderEmail
+            )
+            correctionStatus = "Removed the correction for \(correction.senderEmail)"
+                + " — \(affected) message\(affected == 1 ? "" : "s") re-evaluated."
+        } catch {
+            correctionStatus = "Could not remove the correction: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Golden Set & Evaluation
 
     func loadGoldenLabels(accountId: Int64) async {
@@ -729,16 +833,23 @@ final class AppState: ObservableObject {
     /// Returns the rules-only engine unless cloud categorization is explicitly enabled.
     private func makeEngine(accountId: Int64, contacts: Set<String>) -> CategorizationEngine {
         let rules = RuleBasedEngine(knownContacts: contacts)
+        let db = database
 
-        guard let ai = settings?.aiConfig, ai.isEnabled else { return rules }
+        // Corrections wrap whatever sits beneath, so they outrank both the rules and the
+        // model, and apply even when the model is switched off.
+        func correcting(_ base: CategorizationEngine) -> CategorizationEngine {
+            guard !corrections.isEmpty else { return base }
+            return CorrectingEngine(base: base, corrections: corrections)
+        }
+
+        guard let ai = settings?.aiConfig, ai.isEnabled else { return correcting(rules) }
 
         let transport = BedrockLLMTransport(
             modelId: ai.modelId.isEmpty ? BedrockLLMTransport.defaultModelId : ai.modelId,
             region: ai.region.isEmpty ? nil : ai.region
         )
 
-        let db = database
-        return AICategorizationEngine(
+        let engine = AICategorizationEngine(
             rules: rules,
             transport: transport,
             cache: db,
@@ -746,12 +857,23 @@ final class AppState: ObservableObject {
             sampleSubjects: { sender in
                 (try? await db.sampleSubjects(accountId: accountId, senderEmail: sender)) ?? []
             },
+            // Absent unless explicitly enabled, so there is no path that reads message
+            // content without the user having asked for it.
+            sampleSnippets: ai.sendBodyPreviews
+                ? { sender in
+                    (try? await db.sampleSnippets(accountId: accountId, senderEmail: sender)) ?? []
+                }
+                : nil,
+            correctionExamples: {
+                (try? await db.correctionExamples(accountId: accountId)) ?? []
+            },
             onDiagnostics: { [weak self] diagnostics in
                 Task { @MainActor in
                     self?.aiDiagnostics = diagnostics.summary
                 }
             }
         )
+        return correcting(engine)
     }
 
     /// Categorize with the configured engine, falling back to rules on failure.

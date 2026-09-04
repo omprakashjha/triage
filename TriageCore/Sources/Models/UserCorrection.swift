@@ -21,7 +21,9 @@ import GRDB
 ///
 /// It also doubles as a golden label, so accuracy becomes measurable from ordinary use
 /// rather than needing a separate labelling chore.
-public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Sendable, Equatable {
+public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Sendable, Equatable,
+    Identifiable
+{
     public static let databaseTableName = "userCorrection"
 
     public var id: Int64?

@@ -97,6 +97,23 @@ public extension AppDatabase {
 // MARK: - Sender heterogeneity
 
 public extension AppDatabase {
+    /// Every stored message from one sender.
+    ///
+    /// Used to re-categorize just that sender after a correction. Scoping the pass to the
+    /// affected sender is what makes a correction feel immediate — waiting through a full
+    /// mailbox pass to see your own instruction applied is how a feature like this stops
+    /// being used.
+    func emails(accountId: Int64, senderEmail: String) async throws -> [EmailMetadata] {
+        try await dbWriter.read { db in
+            try EmailMetadata
+                .filter(Column("accountId") == accountId)
+                .filter(Column("senderEmail").lowercased == senderEmail.lowercased())
+                .fetchAll(db)
+        }
+    }
+}
+
+public extension AppDatabase {
     /// Body previews for a sender, for the model to read.
     ///
     /// Separate from `sampleSubjects` so the caller must opt in explicitly: this returns
