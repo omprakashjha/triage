@@ -52,8 +52,11 @@ final class RuleBasedEngineTests: XCTestCase {
         XCTAssertLessThan(results[0].confidence, 0.7, "must fall below the AI ambiguity threshold")
     }
 
-    func testGenuineNewsletterSubjectStaysAutoActionable() async throws {
-        // Positive evidence keeps the cleanup power.
+    func testNewsletterSubjectSuggestsCategoryButNotAutoAction() async throws {
+        // A literal "weekly digest" is a useful hint, but it is still an ENGLISH keyword
+        // and this mailbox is substantially Dutch — so it names the category without
+        // authorising action on it. The sender triage screen is where bulk approval
+        // belongs, rather than a keyword the mailbox may never contain.
         let email = makeEmail(
             senderEmail: "editor@somesite.com",
             subject: "Weekly digest: what happened",
@@ -62,7 +65,7 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .newsletter)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].safetyTier, .review)
     }
 
     func testDutchUtilityBillIsNotTreatedAsDisposableNewsletter() async throws {
@@ -180,7 +183,11 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .notification)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        // NOT .safe any more, and this is the Vitens lesson generalised: `noreply@`
+        // proves nobody reads replies, not that the content is disposable. The water
+        // bill that started this was noreply@mail.vitens.nl.
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertEqual(results[0].evidence, .weak)
     }
 
     func testNotificationsPrefix() async throws {
@@ -314,8 +321,11 @@ final class RuleBasedEngineTests: XCTestCase {
         let email = makeEmail(senderEmail: "no-reply@someservice.com", subject: "Scheduled maintenance")
         let results = try await engine.categorize(emails: [email])
 
+        // The token still matches — that is what this test is about — but matching it no
+        // longer authorises auto-action, because an unattended mailbox says nothing about
+        // whether the content matters.
         XCTAssertEqual(results[0].category, .notification)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].safetyTier, .review)
     }
 
     // MARK: - Helpers

@@ -9,6 +9,34 @@ public protocol CategorizationEngine: Sendable {
     func categorize(emails: [EmailMetadata]) async throws -> [CategorizationResult]
 }
 
+/// What kind of evidence a decision rests on.
+///
+/// This exists because confidence was doing a job it could not do. The confidence values
+/// are hand-assigned literals — 0.85 for a domain-list hit, 0.7 for an English subject
+/// keyword — and nothing measured them. Using a numeric threshold to decide when to ask
+/// the AI therefore meant a baseless 0.85 outranked the one component able to read the
+/// mail, which is how a Dutch water bill became an auto-actionable newsletter.
+///
+/// Measured on a real 403-email mailbox: only 20% of decisions rested on structural
+/// evidence. The rest came from an unsubscribe header, a `noreply@` prefix, or an
+/// English keyword in a substantially Dutch inbox.
+public enum EvidenceStrength: String, Sendable, Codable, Equatable {
+    /// The sender is explicitly known: a listed domain, a marketing platform, a contact.
+    /// Language-independent and safe to act on.
+    case strong
+    /// A heuristic fired, but it says little about whether the mail matters. An
+    /// unsubscribe header proves BULK not DISPOSABLE; `noreply@` proves nobody reads
+    /// replies, not that the content is worthless; an English keyword proves nothing at
+    /// all in a mailbox that is not in English.
+    case weak
+    /// Nothing matched.
+    case none
+
+    /// Only strong evidence may put mail in the auto-actionable tier without a model or
+    /// a human having looked at it.
+    public var canAutoAction: Bool { self == .strong }
+}
+
 /// Result of categorizing a single email
 public struct CategorizationResult: Sendable {
     public let messageId: String
@@ -16,19 +44,23 @@ public struct CategorizationResult: Sendable {
     public let safetyTier: SafetyTier
     public let confidence: Double  // 0.0 - 1.0
     public let reason: String      // Human-readable reason for the categorization
+    /// What the decision actually rests on. Drives whether the AI is consulted.
+    public let evidence: EvidenceStrength
 
     public init(
         messageId: String,
         category: EmailCategory,
         safetyTier: SafetyTier,
         confidence: Double,
-        reason: String
+        reason: String,
+        evidence: EvidenceStrength = .weak
     ) {
         self.messageId = messageId
         self.category = category
         self.safetyTier = safetyTier
         self.confidence = confidence
         self.reason = reason
+        self.evidence = evidence
     }
 }
 
@@ -59,7 +91,31 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
 
     // MARK: - Core Classification Logic
 
+    /// Classify, then enforce the evidence invariant.
+    ///
+    /// A single chokepoint rather than trusting ~15 call sites to get the tier right:
+    /// the auto-actionable tier now REQUIRES strong evidence, so a heuristic can suggest
+    /// a category but cannot authorise acting on it. This is what stops the next
+    /// unexamined weak rule from quietly producing another deletable water bill.
     private func categorizeEmail(_ email: EmailMetadata) -> CategorizationResult {
+        Self.enforcingEvidenceInvariant(classify(email))
+    }
+
+    static func enforcingEvidenceInvariant(_ result: CategorizationResult) -> CategorizationResult {
+        guard result.safetyTier == .safe, !result.evidence.canAutoAction else { return result }
+        return CategorizationResult(
+            messageId: result.messageId,
+            category: result.category,
+            safetyTier: .review,
+            // Cap the reported confidence too, so it cannot sit above the AI threshold
+            // and block the one component that can actually read this mail.
+            confidence: min(result.confidence, 0.6),
+            reason: result.reason + " — heuristic only, needs review",
+            evidence: result.evidence
+        )
+    }
+
+    private func classify(_ email: EmailMetadata) -> CategorizationResult {
         // Priority order of rules (first match wins):
         // 1. Known contact → PERSONAL + PROTECTED
         // 2. List-Unsubscribe header → NEWSLETTER
@@ -74,7 +130,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .personal,
                 safetyTier: .protected_,
                 confidence: 0.95,
-                reason: "From known contact"
+                reason: "From known contact",
+                evidence: .strong
             )
         }
 
@@ -164,7 +221,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .transactional,
                 safetyTier: .review,
                 confidence: 0.7,
-                reason: "Transactional sender with a List-Unsubscribe header"
+                reason: "Transactional sender with a List-Unsubscribe header",
+                evidence: .strong
             )
         }
 
@@ -175,7 +233,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .promotion,
                 safetyTier: .safe,
                 confidence: 0.9,
-                reason: "Promotional sender with List-Unsubscribe"
+                reason: "Promotional sender with List-Unsubscribe",
+                evidence: .strong
             )
         }
 
@@ -239,7 +298,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .transactional,
                 safetyTier: .review,
                 confidence: 0.75,
-                reason: "Transactional sender"
+                reason: "Transactional sender",
+                evidence: .strong
             )
         }
 
@@ -254,7 +314,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 confidence: 0.85,
                 reason: promoStrength == .platform
                     ? "Sent via a bulk-marketing platform"
-                    : "Known promotional sender domain"
+                    : "Known promotional sender domain",
+                evidence: .strong
             )
         }
 
@@ -265,7 +326,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .notification,
                 safetyTier: .safe,
                 confidence: 0.8,
-                reason: "Known notification sender"
+                reason: "Known notification sender",
+                evidence: .strong
             )
         }
 
@@ -275,7 +337,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .social,
                 safetyTier: .safe,
                 confidence: 0.9,
-                reason: "Social media platform"
+                reason: "Social media platform",
+                evidence: .strong
             )
         }
 
@@ -314,7 +377,13 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .promotion,
                 safetyTier: .safe,
                 confidence: 0.8,
-                reason: "Mixed sender (\(domain)) with a promotional subject"
+                reason: "Mixed sender (\(domain)) with a promotional subject",
+                // Two independent signals agree: the domain is explicitly listed AND the
+                // subject is unambiguously promotional. That is the high-volume retailer
+                // case, and losing it would gut the app's automatic cleanup for no
+                // safety gain — order confirmations from these same senders are caught
+                // by the transactional check above.
+                evidence: .strong
             )
         }
 

@@ -148,10 +148,15 @@ public final class AICategorizationEngine: CategorizationEngine {
 
     // MARK: - Selection
 
-    /// Senders whose mail the rules could not confidently resolve.
+    /// Senders whose mail the rules could not resolve on STRONG evidence.
     ///
-    /// Protected mail is excluded: a contact is already settled, and there is no
-    /// verdict the model could return that would improve on that.
+    /// Deliberately not a confidence threshold any more. Confidence is a hand-assigned
+    /// literal, so a baseless 0.85 used to outrank the model and keep whole categories of
+    /// mail away from the only component that could read them — measurably so on a
+    /// non-English mailbox, where 80% of decisions came from heuristics.
+    ///
+    /// Protected mail is still excluded: a contact is already settled, and no verdict
+    /// could improve on that.
     static func sendersNeedingClassification(
         emails: [EmailMetadata],
         ruleResults: [String: CategorizationResult]
@@ -160,7 +165,7 @@ public final class AICategorizationEngine: CategorizationEngine {
         for email in emails {
             guard let result = ruleResults[email.messageId] else { continue }
             if result.safetyTier == .protected_ { continue }
-            if result.category == .unknown || result.confidence < ruleConfidenceCeiling {
+            if !result.evidence.canAutoAction {
                 senders.insert(email.senderEmail.lowercased())
             }
         }
@@ -219,10 +224,11 @@ public final class AICategorizationEngine: CategorizationEngine {
         let verdictRank = strictness(verdict.impliedTier)
         let finalTier = verdictRank > ruleRank ? verdict.impliedTier : rule.safetyTier
 
-        // The model only runs where the rules were unconfident, so its category is
-        // preferred — but a rule result that was already confident keeps its category.
-        let useVerdictCategory = rule.category == .unknown
-            || rule.confidence < AICategorizationEngine.ruleConfidenceCeiling
+        // The model's category wins whenever the rule's own evidence was weak — which is
+        // the only situation the model is consulted in. A read of the actual subject line
+        // beats an English keyword match or a `noreply@` prefix, and on a non-English
+        // mailbox it beats them decisively.
+        let useVerdictCategory = !rule.evidence.canAutoAction
         let finalCategory = useVerdictCategory ? verdict.category : rule.category
 
         let reason = useVerdictCategory
@@ -237,7 +243,10 @@ public final class AICategorizationEngine: CategorizationEngine {
             category: finalCategory,
             safetyTier: finalTier,
             confidence: useVerdictCategory ? verdict.confidence : rule.confidence,
-            reason: reason + tierNote
+            reason: reason + tierNote,
+            // A model verdict counts as strong evidence: something actually read the
+            // mail, rather than pattern-matching its envelope.
+            evidence: useVerdictCategory ? .strong : rule.evidence
         )
     }
 

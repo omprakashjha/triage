@@ -106,14 +106,15 @@ final class AICategorizationEngineTests: XCTestCase {
         // A confident rule result is not overridden, only potentially made safer.
         let ruleResult = CategorizationResult(
             messageId: "m", category: .social, safetyTier: .safe,
-            confidence: 0.9, reason: "rules: social platform"
+            confidence: 0.9, reason: "rules: social platform",
+            evidence: .strong
         )
         let merged = AICategorizationEngine.merge(
             rule: ruleResult,
             verdict: verdict("x@facebook.com", category: .promotion, mustKeep: true)
         )
 
-        XCTAssertEqual(merged.category, .social, "a confident rule keeps its category")
+        XCTAssertEqual(merged.category, .social, "a STRONG rule result keeps its category")
         XCTAssertEqual(merged.safetyTier, .review, "but the model can still raise safety")
     }
 
@@ -134,13 +135,13 @@ final class AICategorizationEngineTests: XCTestCase {
         ]
         let results: [String: CategorizationResult] = [
             "confident": .init(messageId: "confident", category: .promotion, safetyTier: .safe,
-                               confidence: 0.9, reason: ""),
+                               confidence: 0.9, reason: "", evidence: .strong),
             "weak": .init(messageId: "weak", category: .promotion, safetyTier: .review,
                           confidence: 0.45, reason: ""),
             "unknown": .init(messageId: "unknown", category: .unknown, safetyTier: .review,
                              confidence: 0.3, reason: ""),
             "protected": .init(messageId: "protected", category: .personal, safetyTier: .protected_,
-                               confidence: 0.95, reason: ""),
+                               confidence: 0.95, reason: "", evidence: .strong),
         ]
 
         let senders = AICategorizationEngine.sendersNeedingClassification(
@@ -149,7 +150,7 @@ final class AICategorizationEngineTests: XCTestCase {
         )
 
         XCTAssertEqual(senders, ["b@shop.com", "c@shop.com"])
-        XCTAssertFalse(senders.contains("a@shop.com"), "confident rules need no model call")
+        XCTAssertFalse(senders.contains("a@shop.com"), "strong evidence needs no model call")
         XCTAssertFalse(senders.contains("friend@example.com"), "a contact is already settled")
     }
 
