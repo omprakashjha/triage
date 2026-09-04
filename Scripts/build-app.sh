@@ -114,17 +114,26 @@ PLIST
 # Signing with a certificate makes the designated requirement depend on the cert
 # instead, so "Always Allow" survives rebuilds. Run Scripts/setup-signing.sh once.
 SIGN_IDENTITY="Triage Local Signing"
-if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
+# NOTE: deliberately NOT `find-identity -v`. The -v flag means "trusted", and a
+# self-signed certificate is never trusted (it reports CSSMERR_TP_NOT_TRUSTED), so a
+# -v check would never find it. Trust is irrelevant here: codesign can sign with an
+# untrusted identity, and the Keychain ACL keys off the certificate either way.
+if security find-identity -p codesigning 2>/dev/null | grep -q "$SIGN_IDENTITY"; then
     echo "==> signing with '$SIGN_IDENTITY'"
     codesign --force --deep --sign "$SIGN_IDENTITY" --options runtime "$APP" 2>&1 | sed 's/^/    /'
 else
     echo "==> signing (ad-hoc — no stable identity found)"
-    echo "    NOTE: ad-hoc means macOS will ask for your login password every time the"
-    echo "    app reads its stored Gmail tokens, and again after each rebuild."
+    echo "    NOTE: ad-hoc means macOS asks for your login password every time the app"
+    echo "    reads its stored Gmail tokens, and again after each rebuild."
     echo "    Run Scripts/setup-signing.sh once to stop that."
     codesign --force --deep --sign - --options runtime "$APP" 2>&1 | sed 's/^/    /'
 fi
 codesign --verify --verbose=1 "$APP" 2>&1 | sed 's/^/    /'
+
+# Show which form the designated requirement took. 'certificate leaf' survives
+# rebuilds; 'cdhash' does not, and is why the password prompt kept coming back.
+echo "==> designated requirement"
+codesign -d -r- "$APP" 2>&1 | grep -E "designated" | sed 's/^/    /' || true
 
 echo
 echo "built $APP"

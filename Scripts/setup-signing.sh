@@ -1,33 +1,48 @@
 #!/bin/bash
 #
-# Creates a stable self-signed code-signing identity for local development.
+# Creates a stable code-signing identity so macOS stops asking for your login password
+# every time Triage reads its stored Gmail tokens.
 #
-# WHY THIS EXISTS
-# ---------------
-# macOS binds Keychain ACLs to the *code signature* of the app that reads them. An
-# ad-hoc signature (codesign --sign -) has no stable identity: its cdhash changes on
-# every rebuild, so every build is a stranger to the stored Gmail tokens and macOS
-# re-prompts for the login password on every single access.
+# WHY THIS IS NEEDED
+# ------------------
+# macOS binds Keychain ACLs to the code signature of the app that reads them. An ad-hoc
+# signature (codesign --sign -) has a designated requirement of the form
 #
-# Signing with a real certificate instead makes the designated requirement depend on
-# the CERTIFICATE rather than the exact binary hash. Then "Always Allow" sticks across
-# rebuilds, and the tokens stay encrypted in the Keychain where they belong.
+#     designated => cdhash H"aaf68832bd73..."
 #
-# This is NOT for distribution. A self-signed certificate is not trusted by Gatekeeper
-# and cannot notarise; shipping to anyone else needs a Developer ID from an Apple
-# Developer account. This only removes the password prompts on your own machine.
+# which is the hash of that exact binary. Rebuild and the hash changes, so the new build
+# is a stranger to the stored tokens and macOS re-prompts. Signing with a certificate
+# makes the requirement depend on the CERTIFICATE instead, which is stable across
+# rebuilds, so a single "Always Allow" holds.
+#
+# WHAT THIS ASKS OF YOU
+# ---------------------
+# Your login password, once, in this terminal. It is needed for
+# `security set-key-partition-list`, which is the ACL that decides whether codesign may
+# use the new private key WITHOUT a GUI prompt on every build. Skipping that step is
+# what makes codesign hang waiting on a dialog — verified the hard way.
+#
+# The password is read with `read -s` (not echoed), used only for two `security` calls,
+# and never written anywhere.
+#
+# NOT FOR DISTRIBUTION. A self-signed certificate is not trusted by Gatekeeper and
+# cannot be notarised; it will show as CSSMERR_TP_NOT_TRUSTED, which is expected and
+# harmless for local signing. Shipping to other people needs a Developer ID.
 #
 # Run once:  Scripts/setup-signing.sh
-# Undo with: security delete-certificate -c "Triage Local Signing"
+# Undo with: security delete-identity -c "Triage Local Signing"
 
 set -euo pipefail
 
 IDENTITY="Triage Local Signing"
 KEYCHAIN="$HOME/Library/Keychains/login.keychain-db"
 
-if security find-identity -v -p codesigning | grep -q "$IDENTITY"; then
+# NOTE: deliberately NOT `find-identity -v`. The -v flag means "trusted", and a
+# self-signed certificate is never trusted — an earlier version of this script checked
+# -v and therefore always concluded it had failed.
+if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
     echo "'$IDENTITY' already exists — nothing to do."
-    security find-identity -v -p codesigning | grep "$IDENTITY"
+    security find-identity -p codesigning | grep "$IDENTITY"
     exit 0
 fi
 
@@ -35,7 +50,6 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 echo "==> generating a self-signed code-signing certificate"
-# extendedKeyUsage=codeSigning is what makes codesign accept it as an identity.
 openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -keyout "$WORK/key.pem" -out "$WORK/cert.pem" \
     -subj "/CN=$IDENTITY/O=Local Development" \
@@ -43,45 +57,63 @@ openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
     -addext "extendedKeyUsage=critical,codeSigning" \
     -addext "keyUsage=critical,digitalSignature" 2>/dev/null
 
-# Bundle key + cert into a PKCS#12, which is the format `security import` wants for an
-# identity (key and certificate together — a bare certificate is not an identity).
+# The legacy algorithm flags are REQUIRED. OpenSSL 3 defaults to a SHA-256 MAC with
+# AES-256-CBC, which Apple's Security framework cannot verify — `security import` fails
+# with "MAC verification failed during PKCS12 import (wrong password?)", which is a
+# misleading error since the password is fine. macOS wants a SHA-1 MAC with 3DES.
+echo "==> packaging as PKCS#12 (legacy algorithms, required by macOS)"
 openssl pkcs12 -export -out "$WORK/identity.p12" \
     -inkey "$WORK/key.pem" -in "$WORK/cert.pem" \
-    -passout pass: 2>/dev/null
+    -passout pass:triage-temp \
+    -keypbe PBE-SHA1-3DES -certpbe PBE-SHA1-3DES -macalg sha1 2>/dev/null
+
+echo
+echo "Your macOS login password is needed once, to let codesign use the new key"
+echo "without a dialog on every build. It is not echoed and not stored."
+printf "login password: "
+read -rs LOGIN_PASSWORD
+echo
+echo
 
 echo "==> importing into the login keychain"
-echo "    macOS may ask for your login password — that is this script adding the"
-echo "    certificate, and it is the LAST time you should be asked for the app."
-# -T /usr/bin/codesign pre-authorises codesign to use the key without prompting.
 security import "$WORK/identity.p12" \
     -k "$KEYCHAIN" \
-    -P "" \
+    -P triage-temp \
     -T /usr/bin/codesign \
     -T /usr/bin/security
 
-# Without this, codesign still prompts per invocation for key access. The partition
-# list is the modern ACL that governs which tools may use the private key.
 echo "==> authorising codesign to use the key non-interactively"
-if ! security set-key-partition-list -S apple-tool:,apple: -k "" "$KEYCHAIN" >/dev/null 2>&1; then
-    echo "    could not set the partition list without a password."
-    echo "    If codesign prompts on every build, run this once:"
-    echo "      security set-key-partition-list -S apple-tool:,apple: -s -k <login-password> '$KEYCHAIN'"
+# Without this, codesign blocks on a GUI prompt every single invocation.
+if ! security set-key-partition-list \
+        -S apple-tool:,apple:,codesign: \
+        -s -k "$LOGIN_PASSWORD" \
+        "$KEYCHAIN" >/dev/null 2>&1; then
+    echo "    WARNING: could not set the key partition list (wrong password?)." >&2
+    echo "    The identity exists, but codesign may prompt on each build. Retry with:" >&2
+    echo "      security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k <password> '$KEYCHAIN'" >&2
 fi
+unset LOGIN_PASSWORD
 
 echo
-if security find-identity -v -p codesigning | grep -q "$IDENTITY"; then
+if security find-identity -p codesigning 2>/dev/null | grep -q "$IDENTITY"; then
     echo "created:"
-    security find-identity -v -p codesigning | grep "$IDENTITY"
+    security find-identity -p codesigning | grep "$IDENTITY"
+    echo
+    echo "CSSMERR_TP_NOT_TRUSTED above is expected — self-signed certificates are not"
+    echo "trusted by Gatekeeper. It does not stop codesign using this identity, and the"
+    echo "Keychain ACL only cares about the certificate, not its trust status."
     echo
     echo "Next:"
-    echo "  1. Scripts/build-app.sh    # now signs with this identity"
-    echo "  2. Delete the STALE keychain items whose ACL trusts an older build:"
-    echo "       Keychain Access -> search 'com.triage.app' -> delete all matches"
-    echo "     (or: security delete-generic-password -s com.triage.app  — repeat per item)"
-    echo "  3. Launch Triage and reconnect Gmail. Click 'Always Allow' on the prompt."
+    echo "  1. Scripts/build-app.sh          # now signs with this identity"
+    echo "  2. Delete the STALE keychain items, whose ACL trusts a build that no longer"
+    echo "     exists. Keychain Access -> search 'com.triage.app' -> delete every match."
+    echo "  3. Launch Triage, reconnect Gmail, and click 'Always Allow' once."
     echo
-    echo "That prompt should not come back, including after future rebuilds."
+    echo "Verify the signature is certificate-based rather than hash-based with:"
+    echo "  codesign -d -r- build/Triage.app"
+    echo "A line mentioning 'certificate leaf' is what survives rebuilds; one saying"
+    echo "'cdhash H\"...\"' is the ad-hoc form that does not."
 else
-    echo "identity was not created — codesign will fall back to ad-hoc." >&2
+    echo "identity was NOT created — build-app.sh will fall back to ad-hoc signing." >&2
     exit 1
 fi
