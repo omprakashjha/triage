@@ -179,13 +179,39 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
             )
         }
 
-        // Default: newsletter (has unsubscribe but not clearly promotional)
+        // Positive evidence of an actual newsletter keeps the auto-actionable tier, so
+        // genuine digests are still cleaned up without a review step.
+        let subject = email.subject.lowercased()
+        if let pattern = Self.newsletterSubjectPatterns.first(where: { subject.contains($0) }) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .newsletter,
+                safetyTier: .safe,
+                confidence: 0.85,
+                reason: "Newsletter subject (\"\(pattern)\") with List-Unsubscribe"
+            )
+        }
+
+        // Fallback: bulk mail from a sender we do not recognise.
+        //
+        // This used to return newsletter/.safe at 0.85, which was wrong twice over. A
+        // `List-Unsubscribe` header proves mail is BULK, not that it is DISPOSABLE —
+        // utilities, insurers and banks all send statements with one. Real example:
+        // "Jaarafrekening van waterbedrijf Vitens" (an annual water bill) from
+        // noreply@mail.vitens.nl was classified newsletter/.safe at 0.85 confidence.
+        //
+        // The high confidence made it worse than a mere mislabel: 0.85 sits above the
+        // AI engine's ambiguity threshold, so the sender was never sent for
+        // classification and the model — which reads Dutch perfectly well — never got
+        // the chance to correct it. Low confidence here is what routes these senders to
+        // the AI, and .review is what stops them being auto-actioned in the meantime.
         return CategorizationResult(
             messageId: email.messageId,
             category: .newsletter,
-            safetyTier: .safe,
-            confidence: 0.85,
-            reason: "Has List-Unsubscribe header"
+            safetyTier: .review,
+            confidence: 0.5,
+            reason: "Bulk mail (List-Unsubscribe) from an unrecognised sender — "
+                + "bulk does not mean disposable, so this needs review"
         )
     }
 

@@ -50,6 +50,8 @@ final class AppState: ObservableObject {
     /// Progress and outcome of the maintenance actions, so they are never silent.
     @Published var isRecategorizing = false
     @Published var maintenanceStatus: String?
+    /// What the last AI pass actually did, counted rather than inferred.
+    @Published var aiDiagnostics: String?
     /// Contact detection failing is a narrower problem than the scan failing, and is
     /// reported separately so the two are not confused.
     @Published var contactDetectionWarning: String?
@@ -743,6 +745,11 @@ final class AppState: ObservableObject {
             accountId: accountId,
             sampleSubjects: { sender in
                 (try? await db.sampleSubjects(accountId: accountId, senderEmail: sender)) ?? []
+            },
+            onDiagnostics: { [weak self] diagnostics in
+                Task { @MainActor in
+                    self?.aiDiagnostics = diagnostics.summary
+                }
             }
         )
     }

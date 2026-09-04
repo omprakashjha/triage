@@ -36,7 +36,10 @@ final class RuleBasedEngineTests: XCTestCase {
 
     // MARK: - List-Unsubscribe (Rule 2)
 
-    func testListUnsubscribeIsNewsletter() async throws {
+    func testListUnsubscribeAloneIsNotAutoActionable() async throws {
+        // An unsubscribe header proves the mail is BULK, not that it is disposable.
+        // From an unrecognised sender with no other signal, that must not be
+        // auto-actionable — and the low confidence is what sends the sender to the AI.
         let email = makeEmail(
             senderEmail: "updates@randomsite.com",
             subject: "Your weekly update",
@@ -45,7 +48,41 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .newsletter)
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertLessThan(results[0].confidence, 0.7, "must fall below the AI ambiguity threshold")
+    }
+
+    func testGenuineNewsletterSubjectStaysAutoActionable() async throws {
+        // Positive evidence keeps the cleanup power.
+        let email = makeEmail(
+            senderEmail: "editor@somesite.com",
+            subject: "Weekly digest: what happened",
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .newsletter)
         XCTAssertEqual(results[0].safetyTier, .safe)
+    }
+
+    func testDutchUtilityBillIsNotTreatedAsDisposableNewsletter() async throws {
+        // Real regression: "Jaarafrekening van waterbedrijf Vitens" (an annual water
+        // bill) from noreply@mail.vitens.nl was classified newsletter/.safe at 0.85.
+        // Every English subject pattern misses it, the sender is unlisted, and the
+        // `mail.` subdomain is only a generic transport signal — so the unsubscribe
+        // fallback decided it, confidently and wrongly.
+        let email = makeEmail(
+            senderEmail: "noreply@mail.vitens.nl",
+            subject: "Jaarafrekening van waterbedrijf Vitens",
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe, "a utility bill must not be auto-actionable")
+        XCTAssertLessThan(
+            results[0].confidence, 0.7,
+            "must be low enough that the AI is asked, since the rules cannot read Dutch"
+        )
     }
 
     func testListUnsubscribeFromPromoIsPromo() async throws {

@@ -14,6 +14,29 @@ import Foundation
 ///    user one unnecessary manual review, never a deleted receipt. This is enforced
 ///    here in code rather than requested in the prompt, because a prompt is not a
 ///    guarantee.
+/// What one AI categorization pass actually did.
+///
+/// Exists because the engine's effect was being inferred from stored reasons and got it
+/// wrong: 22 verdicts were cached while zero emails carried AI attribution, and no
+/// amount of reading the code settled why. Counting the steps is cheaper than guessing.
+public struct AIRunDiagnostics: Sendable {
+    public var sendersConsidered = 0
+    public var verdictsFromCache = 0
+    public var batchesRequested = 0
+    public var verdictsReturned = 0
+    public var mergesApplied = 0
+    public var failure: String?
+
+    public var summary: String {
+        if let failure {
+            return "AI pass FAILED after \(verdictsReturned) verdicts: \(failure)"
+        }
+        return "AI: \(sendersConsidered) ambiguous senders, "
+            + "\(verdictsFromCache) cached + \(verdictsReturned) fetched in \(batchesRequested) call(s), "
+            + "\(mergesApplied) emails merged."
+    }
+}
+
 public final class AICategorizationEngine: CategorizationEngine {
 
     /// Rule results at or above this confidence are accepted as-is and never sent to
@@ -28,22 +51,44 @@ public final class AICategorizationEngine: CategorizationEngine {
     private let cache: SenderVerdictCaching
     private let accountId: Int64
     private let sampleSubjects: (String) async -> [String]
+    /// Reports what the pass did. Called once per `categorize`, success or failure.
+    private let onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)?
 
     public init(
         rules: RuleBasedEngine,
         transport: LLMTransport,
         cache: SenderVerdictCaching,
         accountId: Int64,
-        sampleSubjects: @escaping (String) async -> [String] = { _ in [] }
+        sampleSubjects: @escaping (String) async -> [String] = { _ in [] },
+        onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)? = nil
     ) {
         self.rules = rules
         self.transport = transport
         self.cache = cache
         self.accountId = accountId
         self.sampleSubjects = sampleSubjects
+        self.onDiagnostics = onDiagnostics
     }
 
     public func categorize(emails: [EmailMetadata]) async throws -> [CategorizationResult] {
+        var diagnostics = AIRunDiagnostics()
+        do {
+            let results = try await runCategorize(emails: emails, diagnostics: &diagnostics)
+            onDiagnostics?(diagnostics)
+            return results
+        } catch {
+            // Report BEFORE rethrowing. Without this a mid-pass failure looks identical
+            // to the AI having no effect, which is exactly what happened.
+            diagnostics.failure = error.localizedDescription
+            onDiagnostics?(diagnostics)
+            throw error
+        }
+    }
+
+    private func runCategorize(
+        emails: [EmailMetadata],
+        diagnostics: inout AIRunDiagnostics
+    ) async throws -> [CategorizationResult] {
         let ruleResults = try await rules.categorize(emails: emails)
         guard !emails.isEmpty else { return ruleResults }
 
@@ -57,6 +102,7 @@ public final class AICategorizationEngine: CategorizationEngine {
             emails: emails,
             ruleResults: resultsById
         )
+        diagnostics.sendersConsidered = ambiguousSenders.count
         guard !ambiguousSenders.isEmpty else { return ruleResults }
 
         // Cached verdicts cost nothing — a rescan should not re-pay for a sender
@@ -67,12 +113,15 @@ public final class AICategorizationEngine: CategorizationEngine {
             modelId: transport.modelId,
             promptVersion: transport.promptVersion
         )
+        diagnostics.verdictsFromCache = verdicts.count
 
         let uncached = ambiguousSenders.filter { verdicts[$0] == nil }
         if !uncached.isEmpty {
             let requests = await buildRequests(for: uncached, emails: emails)
             for batch in requests.chunked(into: Self.batchSize) {
+                diagnostics.batchesRequested += 1
                 let fresh = try await transport.classify(senders: batch)
+                diagnostics.verdictsReturned += fresh.count
                 try await cache.storeVerdicts(
                     fresh,
                     accountId: accountId,
@@ -90,6 +139,7 @@ public final class AICategorizationEngine: CategorizationEngine {
             guard let ruleResult = resultsById[email.messageId] else { continue }
             guard let verdict = verdicts[email.senderEmail.lowercased()] else { continue }
             resultsById[email.messageId] = Self.merge(rule: ruleResult, verdict: verdict)
+            diagnostics.mergesApplied += 1
         }
 
         // Preserve input order.

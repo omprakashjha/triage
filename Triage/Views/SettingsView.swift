@@ -304,6 +304,16 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
+            // Counted, not inferred. A pass that cached verdicts but merged nothing looks
+            // identical to a pass that never ran unless the steps are reported.
+            if let diagnostics = appState.aiDiagnostics {
+                Text(diagnostics)
+                    .font(.caption2)
+                    .foregroundStyle(diagnostics.contains("FAILED") ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
             Label(
                 "A model verdict can only ever make mail safer. Moving mail toward deletion always requires the local rules to agree.",
                 systemImage: "lock.shield"
