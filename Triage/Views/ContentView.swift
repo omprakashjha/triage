@@ -50,6 +50,31 @@ struct ContentView: View {
         .task {
             await appState.loadAccounts()
         }
+        // The primary action belongs in the toolbar, not buried in one view.
+        // Scan/Rescan previously existed ONLY inside InboxOverviewView and only when
+        // selectedAccount was non-nil, so switching to Senders, History, Accuracy or
+        // Settings — or losing the sidebar selection — made scanning unreachable.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await appState.scanSelectedAccount() }
+                } label: {
+                    if appState.isScanning {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small)
+                            Text("Scanning…")
+                        }
+                    } else {
+                        Label(
+                            appState.accountStats == nil ? "Scan" : "Rescan",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                }
+                .disabled(appState.isScanning || appState.scanTarget == nil)
+                .help(appState.scanTarget.map { "Scan \($0.email)" } ?? "Add an account first")
+            }
+        }
     }
 }
 
@@ -65,6 +90,16 @@ struct SidebarView: View {
                     Label(account.email, systemImage: account.provider.iconName)
                         .tag(account)
                         .contextMenu {
+                            Button {
+                                Task {
+                                    appState.selectedAccount = account
+                                    await appState.startGmailScan(for: account)
+                                }
+                            } label: {
+                                Label("Scan This Account", systemImage: "arrow.clockwise")
+                            }
+                            .disabled(appState.isScanning)
+
                             Button {
                                 Task { await appState.reconnectAccount(account) }
                             } label: {
@@ -304,14 +339,11 @@ struct InboxOverviewView: View {
                     }
 
                     HStack(spacing: 12) {
-                        if let account = appState.selectedAccount {
-                            Button("Rescan") {
-                                Task {
-                                    await appState.startGmailScan(for: account)
-                                }
-                            }
-                            .buttonStyle(.bordered)
+                        Button("Rescan") {
+                            Task { await appState.scanSelectedAccount() }
                         }
+                        .buttonStyle(.bordered)
+                        .disabled(appState.isScanning || appState.scanTarget == nil)
 
                         Button("Generate Action Plan") {
                             Task {
@@ -337,14 +369,17 @@ struct InboxOverviewView: View {
                 Text("Select an account and scan to begin cleanup.")
                     .foregroundStyle(.secondary)
 
-                if let account = appState.selectedAccount {
+                if let account = appState.scanTarget {
                     Button("Scan \(account.email)") {
-                        Task {
-                            await appState.startGmailScan(for: account)
-                        }
+                        Task { await appState.scanSelectedAccount() }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .disabled(appState.isScanning)
+                } else {
+                    Text("Add an account to get started.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }

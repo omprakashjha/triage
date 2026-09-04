@@ -75,6 +75,25 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The account a scan would act on.
+    ///
+    /// Falls back to the first account when the sidebar has no selection, so the toolbar
+    /// action is never dead just because a selection was lost — which is exactly how the
+    /// old in-view Scan button became unreachable.
+    var scanTarget: EmailAccount? {
+        selectedAccount ?? accounts.first
+    }
+
+    /// Scan whichever account is targeted, selecting it first so the UI agrees with what
+    /// is being scanned.
+    func scanSelectedAccount() async {
+        guard let account = scanTarget else { return }
+        if selectedAccount?.id != account.id {
+            selectedAccount = account
+        }
+        await startGmailScan(for: account)
+    }
+
     func loadAccounts() async {
         do {
             accounts = try await database.fetchAllAccounts()
