@@ -41,6 +41,16 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/Triage"
 
+# The icon is drawn from source rather than committed as a binary, so it can be edited
+# and re-rendered. Regenerated only when the renderer is newer than its output, because
+# it costs a few seconds to compile.
+ICNS="$ROOT/build/Triage.icns"
+if [ ! -f "$ICNS" ] || [ "$ROOT/Scripts/make-icon.swift" -nt "$ICNS" ]; then
+    echo "==> drawing icon"
+    swift "$ROOT/Scripts/make-icon.swift" "$ICNS" | sed 's/^/    /'
+fi
+cp "$ICNS" "$APP/Contents/Resources/Triage.icns"
+
 # The OAuth callback scheme is the REVERSED client id, which lives in the gitignored
 # Secrets.swift. Read it at build time so the scheme can be declared in the bundle
 # without the client id ever being committed. Optional: the auth session does not
@@ -79,6 +89,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
+    <key>CFBundleIconFile</key><string>Triage</string>
     <key>LSMinimumSystemVersion</key><string>14.0</string>
     <key>NSHighResolutionCapable</key><true/>
 
