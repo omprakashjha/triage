@@ -92,6 +92,55 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         XCTAssertEqual(results[0].safetyTier, .protected_)
     }
 
+    func testKeepDecisionAloneDrivesTheTierForEveryCategory() async throws {
+        // Regression, found by the user: they set their broker's "daily activity statement"
+        // to `notification` and unticked "never delete this automatically", and the mail
+        // stayed in review — because the tier fell back to whether the CATEGORY is
+        // typically disposable, and notifications are not. An explicit instruction was
+        // being overruled by a heuristic. 27 emails were held by it.
+        for category in EmailCategory.allCases {
+            let disposable = UserCorrection(
+                accountId: 1, senderEmail: "x@example.com",
+                category: category, mustKeep: false
+            )
+            XCTAssertEqual(
+                disposable.impliedTier, .safe,
+                "\(category.rawValue) marked deletable must be actionable"
+            )
+
+            let kept = UserCorrection(
+                accountId: 1, senderEmail: "x@example.com",
+                category: category, mustKeep: true
+            )
+            XCTAssertEqual(
+                kept.impliedTier, .protected_,
+                "\(category.rawValue) marked keep must be protected"
+            )
+        }
+    }
+
+    func testNotificationCorrectionReachesTheActionableTierEndToEnd() async throws {
+        // The user's exact case, through the engine rather than the model in isolation.
+        let correction = UserCorrection(
+            accountId: 1,
+            senderEmail: "donotreply@interactivebrokers.com",
+            subjectPattern: "daily activity statement",
+            category: .notification,
+            mustKeep: false
+        )
+        let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [correction])
+
+        let results = try await engine.categorize(emails: [
+            email(
+                sender: "donotreply@interactivebrokers.com",
+                subject: "Daily Activity Statement for 4 September"
+            )
+        ])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].category, .notification)
+    }
+
     func testCorrectionCanMakeMailAutoActionableAlone() async throws {
         // Unlike a model verdict, a correction needs no corroboration. Refusing to honour
         // an explicit instruction is its own kind of failure.

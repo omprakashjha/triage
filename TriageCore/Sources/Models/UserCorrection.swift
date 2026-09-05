@@ -84,13 +84,23 @@ public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Senda
 
     /// The tier this correction implies.
     ///
+    /// Determined by `mustKeep` ALONE. The category is a label; whether mail may be deleted
+    /// is a separate decision, which is exactly why the sheet asks the two questions
+    /// separately.
+    ///
+    /// This previously fell back to `category.isTypicallyDisposable`, so a user who
+    /// categorised their broker's daily activity statements as `notification` and
+    /// explicitly unticked "never delete this automatically" got `.review` anyway — because
+    /// notifications are not "typically" disposable. That is an instruction being overruled
+    /// by a heuristic, which is the failure mode this whole type exists to end. 27 emails
+    /// across three corrections were held in review by it.
+    ///
     /// A correction may make mail auto-actionable, unlike a model verdict, which needs
     /// corroboration. The user is not a fallible classifier being trusted on its own
-    /// judgement — they are the authority the app exists to serve, and refusing to act on
+    /// judgement — they are the authority the app exists to serve, and declining to act on
     /// an explicit instruction is its own kind of failure.
     public var impliedTier: SafetyTier {
-        if mustKeep { return .protected_ }
-        return category.isTypicallyDisposable ? .safe : .review
+        mustKeep ? .protected_ : .safe
     }
 
     /// Whether this correction governs a given message.
