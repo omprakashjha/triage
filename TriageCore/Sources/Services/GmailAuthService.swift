@@ -17,10 +17,11 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
         "https://www.googleapis.com/auth/gmail.readonly"
     ]
 
-    // Keychain keys
-    private static let accessTokenKey = "gmail_access_token"
-    private static let refreshTokenKey = "gmail_refresh_token"
-    private static let expiresAtKey = "gmail_expires_at"
+    /// In-process token cache, so one scan does not re-authorise against the Keychain
+    /// for every access. Guarded by a lock because this type is `@unchecked Sendable`
+    /// and `getValidTokens()` is reachable off the main actor.
+    private var cachedTokens: OAuthTokens?
+    private let cacheLock = NSLock()
 
     public init(clientId: String) {
         self.clientId = clientId
@@ -47,7 +48,8 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
         let code = try extractAuthCode(from: callbackURL, expectedState: state)
         let tokens = try await exchangeCodeForTokens(code: code, codeVerifier: codeVerifier)
 
-        try saveTokens(tokens)
+        // Initial sign-in must always write: there is nothing stored yet.
+        try saveTokens(tokens, forcePersist: true)
         return tokens
     }
 
@@ -73,9 +75,15 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
 
     /// Clear stored credentials (sign out)
     public func signOut() throws {
-        try keychain.remove(Self.accessTokenKey)
-        try keychain.remove(Self.refreshTokenKey)
-        try keychain.remove(Self.expiresAtKey)
+        cacheLock.lock()
+        cachedTokens = nil
+        cacheLock.unlock()
+
+        try? keychain.remove(Self.tokensKey)
+        // Legacy items, in case sign-out happens before a migration ever ran.
+        try? keychain.remove(Self.legacyAccessTokenKey)
+        try? keychain.remove(Self.legacyRefreshTokenKey)
+        try? keychain.remove(Self.legacyExpiresAtKey)
     }
 
     // MARK: - OAuth Flow Implementation
@@ -228,25 +236,91 @@ public final class GmailAuthService: NSObject, @unchecked Sendable {
 
     // MARK: - Keychain Storage
 
-    private func saveTokens(_ tokens: OAuthTokens) throws {
-        try keychain.set(tokens.accessToken, key: Self.accessTokenKey)
-        try keychain.set(tokens.refreshToken, key: Self.refreshTokenKey)
-        let expiresAtString = ISO8601DateFormatter().string(from: tokens.expiresAt)
-        try keychain.set(expiresAtString, key: Self.expiresAtKey)
+    /// All tokens live in ONE Keychain item, as JSON.
+    ///
+    /// This matters for more than tidiness. Every Keychain access is a separate
+    /// authorisation check, so the previous design — three items read individually and
+    /// written individually — produced SIX password prompts for a single scan with an
+    /// expired token (three reads, then three writes after the refresh). One item is
+    /// one prompt.
+    private static let tokensKey = "gmail_oauth_tokens"
+
+    /// Superseded by ``tokensKey``. Read once during migration, then deleted.
+    private static let legacyAccessTokenKey = "gmail_access_token"
+    private static let legacyRefreshTokenKey = "gmail_refresh_token"
+    private static let legacyExpiresAtKey = "gmail_expires_at"
+
+    /// Update the tokens, persisting only when the durable half actually changed.
+    ///
+    /// The access token expires in about an hour and is re-derivable from the refresh
+    /// token, so writing it back to the Keychain after every refresh costs one
+    /// authorisation — a password prompt — and buys nothing. The refresh token is the
+    /// only part worth storing, and it rarely changes.
+    ///
+    /// `forcePersist` is for the two cases where we must write regardless: the initial
+    /// sign-in, and the migration off the legacy layout.
+    private func saveTokens(_ tokens: OAuthTokens, forcePersist: Bool = false) throws {
+        cacheLock.lock()
+        let previousRefresh = cachedTokens?.refreshToken
+        cachedTokens = tokens
+        cacheLock.unlock()
+
+        // No cache means we cannot know what is stored, so write to be safe.
+        let refreshTokenChanged = previousRefresh == nil || previousRefresh != tokens.refreshToken
+        guard forcePersist || refreshTokenChanged else { return }
+
+        let data = try JSONEncoder().encode(tokens)
+        try keychain.set(data, key: Self.tokensKey)
     }
 
+    /// Load tokens, preferring the in-process cache.
+    ///
+    /// The cache exists because a single scan asks for tokens more than once, and
+    /// without it each ask is another prompt. It holds for the process lifetime only —
+    /// tokens are never written anywhere except the Keychain.
     private func loadTokens() -> OAuthTokens? {
-        guard let accessToken = try? keychain.get(Self.accessTokenKey),
-              let refreshToken = try? keychain.get(Self.refreshTokenKey),
-              let expiresAtString = try? keychain.get(Self.expiresAtKey),
+        cacheLock.lock()
+        if let cached = cachedTokens {
+            cacheLock.unlock()
+            return cached
+        }
+        cacheLock.unlock()
+
+        if let data = try? keychain.getData(Self.tokensKey),
+           let tokens = try? JSONDecoder().decode(OAuthTokens.self, from: data) {
+            cacheLock.lock()
+            cachedTokens = tokens
+            cacheLock.unlock()
+            return tokens
+        }
+
+        // Nothing under the combined key — fall back to the three legacy items and
+        // collapse them. Costs three prompts exactly once, then never again.
+        return migrateLegacyTokens()
+    }
+
+    /// One-time migration from the three-item layout to the single item.
+    private func migrateLegacyTokens() -> OAuthTokens? {
+        guard let accessToken = try? keychain.get(Self.legacyAccessTokenKey),
+              let refreshToken = try? keychain.get(Self.legacyRefreshTokenKey),
+              let expiresAtString = try? keychain.get(Self.legacyExpiresAtKey),
               let expiresAt = ISO8601DateFormatter().date(from: expiresAtString) else {
             return nil
         }
-        return OAuthTokens(
+
+        let tokens = OAuthTokens(
             accessToken: accessToken,
             refreshToken: refreshToken,
             expiresAt: expiresAt
         )
+
+        // Write the combined item first, so a failure here cannot lose the tokens.
+        try? saveTokens(tokens, forcePersist: true)
+        try? keychain.remove(Self.legacyAccessTokenKey)
+        try? keychain.remove(Self.legacyRefreshTokenKey)
+        try? keychain.remove(Self.legacyExpiresAtKey)
+
+        return tokens
     }
 }
 

@@ -23,6 +23,22 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
 
     // Gmail-specific
     public var labels: [String]?       // Gmail label IDs
+
+    /// Gmail's OWN classification of this message, from its label IDs.
+    ///
+    /// Worth far more than it looks. Gmail's classifier is multilingual and trained on
+    /// an enormous corpus, whereas this app's rules are hand-written English keyword and
+    /// domain lists. Measured on a real 403-email mailbox, Gmail disagreed with the
+    /// rules on 76 of 122 emails the rules called promotional — calling them Updates,
+    /// i.e. statements and confirmations. It costs nothing: the labels arrive with every
+    /// message and were already being stored and ignored.
+    public var providerCategory: ProviderCategory? {
+        guard let labels else { return nil }
+        for label in labels {
+            if let category = ProviderCategory(gmailLabel: label) { return category }
+        }
+        return nil
+    }
     public var isUnread: Bool
 
     // Categorization
@@ -130,6 +146,18 @@ public enum EmailCategory: String, Codable, CaseIterable, Sendable {
     case social
     case personal
     case unknown
+
+    /// Whether mail of this category is the kind a bulk cleaner exists to remove.
+    ///
+    /// Only a claim about the CATEGORY, never about a specific message — which is why the
+    /// safety tier is tracked separately. A promotional email from a sender the user cares
+    /// about is still promotional and still must not be deleted.
+    public var isTypicallyDisposable: Bool {
+        switch self {
+        case .promotion, .newsletter: return true
+        case .notification, .transactional, .social, .personal, .unknown: return false
+        }
+    }
 
     public var displayName: String {
         rawValue.capitalized

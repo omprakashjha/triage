@@ -14,22 +14,77 @@ struct ContentView: View {
             } else if appState.accounts.isEmpty {
                 WelcomeView()
             } else {
-                switch appState.detailRoute {
-                case .overview:
-                    InboxOverviewView()
-                case .senders:
-                    SenderTriageView()
-                case .history:
-                    HistoryView()
-                case .evaluation:
-                    EvaluationView()
-                case .settings:
-                    SettingsView()
+                VStack(spacing: 0) {
+                    // A failed scan must stay on screen. `isScanning` goes false the
+                    // moment the scan throws, and ScanProgressView — the only thing that
+                    // rendered the failure — stopped being shown with it, so the error
+                    // was computed and then silently discarded. A scan that fails
+                    // invisibly is indistinguishable from a scan that does nothing.
+                    if let progress = appState.scanProgress,
+                       case .failed(let message) = progress.status {
+                        ScanFailureBanner(
+                            message: message,
+                            isReconnecting: appState.isReconnecting,
+                            onReconnect: appState.selectedAccount.map { account in
+                                { Task { await appState.reconnectAccount(account) } }
+                            },
+                            onDismiss: { appState.scanProgress = nil }
+                        )
+                    }
+
+                    // Contact detection failing is narrower than a scan failing, but it
+                    // was being written to a property nothing rendered — the same
+                    // invisible-error mistake as the scan banner. Shown separately and
+                    // less alarmingly, because the consequence is specific: fewer
+                    // contacts means less mail is protected.
+                    if let warning = appState.contactDetectionWarning {
+                        ContactWarningBanner(message: warning) {
+                            appState.contactDetectionWarning = nil
+                        }
+                    }
+
+                    switch appState.detailRoute {
+                    case .overview:
+                        InboxOverviewView()
+                    case .senders:
+                        SenderTriageView()
+                    case .history:
+                        HistoryView()
+                    case .evaluation:
+                        EvaluationView()
+                    case .settings:
+                        SettingsView()
+                    }
                 }
             }
         }
         .task {
             await appState.loadAccounts()
+        }
+        // The primary action belongs in the toolbar, not buried in one view.
+        // Scan/Rescan previously existed ONLY inside InboxOverviewView and only when
+        // selectedAccount was non-nil, so switching to Senders, History, Accuracy or
+        // Settings — or losing the sidebar selection — made scanning unreachable.
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    Task { await appState.scanSelectedAccount() }
+                } label: {
+                    if appState.isScanning {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small)
+                            Text("Scanning…")
+                        }
+                    } else {
+                        Label(
+                            appState.accountStats == nil ? "Scan" : "Rescan",
+                            systemImage: "arrow.clockwise"
+                        )
+                    }
+                }
+                .disabled(appState.isScanning || appState.scanTarget == nil)
+                .help(appState.scanTarget.map { "Scan \($0.email)" } ?? "Add an account first")
+            }
         }
     }
 }
@@ -46,6 +101,24 @@ struct SidebarView: View {
                     Label(account.email, systemImage: account.provider.iconName)
                         .tag(account)
                         .contextMenu {
+                            Button {
+                                Task {
+                                    appState.selectedAccount = account
+                                    await appState.startGmailScan(for: account)
+                                }
+                            } label: {
+                                Label("Scan This Account", systemImage: "arrow.clockwise")
+                            }
+                            .disabled(appState.isScanning)
+
+                            Button {
+                                Task { await appState.reconnectAccount(account) }
+                            } label: {
+                                Label("Reconnect…", systemImage: "arrow.triangle.2.circlepath")
+                            }
+
+                            Divider()
+
                             Button(role: .destructive) {
                                 accountToDelete = account
                                 showDeleteConfirmation = true
@@ -102,8 +175,115 @@ struct SidebarView: View {
                 }
             }
         } message: {
-            Text("This will remove the account and all its local data. Your emails on Gmail won't be affected.")
+            // Spell out the actual consequence: emailMetadata cascades on the account
+            // row, so this discards every scanned message and a rescan has to refetch
+            // them all. Anyone here because of an expired token wants Reconnect instead.
+            Text("This deletes the account AND every email already scanned for it — a rescan would have to fetch them all again. Your mail on Gmail is not affected.\n\nIf you are only fixing an expired login, use “Reconnect…” instead: it keeps the scanned mail.")
         }
+    }
+}
+
+/// Persistent, dismissible banner for a failed scan.
+///
+/// Text is selectable on purpose: the useful part of a Gmail failure is usually the
+/// provider's own message, and it needs to be copyable to be actionable.
+struct ScanFailureBanner: View {
+    let message: String
+    let isReconnecting: Bool
+    let onReconnect: (() -> Void)?
+    let onDismiss: () -> Void
+
+    /// Whether this failure is a credential problem, which is the one case the user can
+    /// fix from here rather than by reading the message.
+    private var looksLikeAuthFailure: Bool {
+        ["invalid_grant", "token", "auth", "credential", "401", "unauthor"]
+            .contains { message.localizedCaseInsensitiveContains($0) }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Scan failed")
+                    .fontWeight(.semibold)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                // The overwhelmingly common cause, stated where it is useful rather
+                // than left for the user to work out: Google expires refresh tokens
+                // after 7 days while the OAuth consent screen is in testing mode.
+                if looksLikeAuthFailure {
+                    Text("Google expires refresh tokens after 7 days while the OAuth consent screen is in testing mode, so an account connected more than a week ago stops working. Reconnect keeps every email already scanned — unlike removing the account, which deletes them.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
+                }
+            }
+
+            Spacer()
+
+            VStack(spacing: 6) {
+                if looksLikeAuthFailure, let onReconnect {
+                    Button(action: onReconnect) {
+                        if isReconnecting {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Text("Reconnect…")
+                        }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(isReconnecting)
+                }
+
+                Button("Dismiss", action: onDismiss)
+                    .buttonStyle(.borderless)
+                    .font(.caption)
+            }
+        }
+        .padding(10)
+        .background(Color.orange.opacity(0.12))
+    }
+}
+
+/// Contact detection problems, which weaken the protected tier without breaking a scan.
+struct ContactWarningBanner: View {
+    let message: String
+    let onDismiss: () -> Void
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark")
+                .foregroundStyle(.yellow)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Contacts not detected")
+                    .fontWeight(.semibold)
+                    .font(.callout)
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Nothing is in the Protected tier until contacts exist, so do not execute a delete plan yet.")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+
+            Spacer()
+
+            Button("Dismiss", action: onDismiss)
+                .buttonStyle(.borderless)
+                .font(.caption)
+        }
+        .padding(10)
+        .background(Color.yellow.opacity(0.12))
     }
 }
 
@@ -205,14 +385,11 @@ struct InboxOverviewView: View {
                     }
 
                     HStack(spacing: 12) {
-                        if let account = appState.selectedAccount {
-                            Button("Rescan") {
-                                Task {
-                                    await appState.startGmailScan(for: account)
-                                }
-                            }
-                            .buttonStyle(.bordered)
+                        Button("Rescan") {
+                            Task { await appState.scanSelectedAccount() }
                         }
+                        .buttonStyle(.bordered)
+                        .disabled(appState.isScanning || appState.scanTarget == nil)
 
                         Button("Generate Action Plan") {
                             Task {
@@ -238,14 +415,17 @@ struct InboxOverviewView: View {
                 Text("Select an account and scan to begin cleanup.")
                     .foregroundStyle(.secondary)
 
-                if let account = appState.selectedAccount {
+                if let account = appState.scanTarget {
                     Button("Scan \(account.email)") {
-                        Task {
-                            await appState.startGmailScan(for: account)
-                        }
+                        Task { await appState.scanSelectedAccount() }
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
+                    .disabled(appState.isScanning)
+                } else {
+                    Text("Add an account to get started.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
             }
         }
@@ -474,8 +654,9 @@ struct AddAccountView: View {
         defer { isAuthenticating = false }
 
         do {
-            let authService = GmailAuthService(clientId: Secrets.gmailClientId)
-            let tokens = try await authService.authenticate()
+            // Uses AppState's shared auth service, so the token it stores is already in
+            // that instance's cache and the following scan needs no further prompt.
+            let tokens = try await appState.authService.authenticate()
             appState.configureGmail(with: tokens)
 
             // Save the account to the database

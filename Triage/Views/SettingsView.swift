@@ -20,6 +20,8 @@ struct SettingsView: View {
                 Divider()
                 aiSection
                 Divider()
+                correctionsSection
+                Divider()
                 maintenanceSection
             }
             .padding(24)
@@ -29,6 +31,7 @@ struct SettingsView: View {
             if let accountId = appState.selectedAccount?.id {
                 await appState.loadSettings(accountId: accountId)
                 await appState.loadSenderRules(accountId: accountId)
+                await appState.loadCorrections(accountId: accountId)
             }
         }
     }
@@ -196,8 +199,82 @@ struct SettingsView: View {
 
     // MARK: - AI
 
-    private var aiSection: some View {
+    /// What the user has taught the app, and a way to take it back.
+    ///
+    /// Corrections outrank every other source, so they need to be visible and reversible.
+    /// A precedence rule the user cannot inspect is one they cannot debug when it produces
+    /// a result they did not expect.
+    private var correctionsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
+            Text("Your corrections")
+                .font(.headline)
+
+            Text("These override both the local rules and the cloud model, and are used as examples when judging senders you haven't corrected.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if appState.corrections.isEmpty {
+                Text("None yet. Use the pencil button on any email to correct its category.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            } else {
+                ForEach(appState.corrections) { correction in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(correction.senderEmail)
+                                .font(.callout)
+                                .textSelection(.enabled)
+                            HStack(spacing: 6) {
+                                Text(correction.category.displayName)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                if correction.mustKeep {
+                                    Text("never delete")
+                                        .font(.caption2)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Color.green.opacity(0.15), in: Capsule())
+                                        .foregroundStyle(.green)
+                                }
+                                if let pattern = correction.subjectPattern {
+                                    Text("subjects with “\(pattern)”")
+                                        .font(.caption2)
+                                        .foregroundStyle(.tertiary)
+                                }
+                            }
+                        }
+                        Spacer()
+                        Button("Remove") {
+                            Task { await appState.removeCorrection(correction) }
+                        }
+                        .buttonStyle(.borderless)
+                        .font(.caption)
+                    }
+                    .padding(.vertical, 2)
+                }
+
+                Button("Add all to the evaluation set") {
+                    Task {
+                        guard let accountId = appState.selectedAccount?.id else { return }
+                        await appState.promoteCorrectionsToLabels(accountId: accountId)
+                    }
+                }
+                .font(.caption)
+                .help("Turns your corrections into golden labels so accuracy can be measured.")
+            }
+
+            if let status = appState.correctionStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+
+    private var aiSection: some View {        VStack(alignment: .leading, spacing: 8) {
             Text("Cloud categorization (optional)")
                 .font(.headline)
 
@@ -227,6 +304,42 @@ struct SettingsView: View {
                     .padding(.top, 4)
             }
             .font(.caption)
+
+            if appState.settings?.aiConfig.isEnabled == true {
+                // Asked as its own question, below its own disclosure. Agreeing to send
+                // subject lines is agreeing to send metadata; agreeing to send the first
+                // line of a body is agreeing to send content. Bundling them would obtain
+                // the second by implying it followed from the first.
+                Toggle(isOn: Binding(
+                    get: { appState.settings?.aiConfig.sendBodyPreviews ?? false },
+                    set: { newValue in
+                        Task {
+                            guard let accountId = appState.selectedAccount?.id else { return }
+                            var config = appState.settings?.aiConfig ?? AIConfig()
+                            config.sendBodyPreviews = newValue
+                            await appState.updateAIConfig(config, accountId: accountId)
+                        }
+                    }
+                )) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Also send a short body preview")
+                        Text("More accurate on mail whose subject is vague — and sends message content.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .padding(.leading, 8)
+
+                DisclosureGroup("What a body preview includes") {
+                    Text(AIConfig.bodyPreviewEgressDescription)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 4)
+                }
+                .font(.caption)
+                .padding(.leading, 8)
+            }
 
             if appState.settings?.aiConfig.isEnabled == true {
                 VStack(alignment: .leading, spacing: 8) {
@@ -304,6 +417,16 @@ struct SettingsView: View {
                     .textSelection(.enabled)
             }
 
+            // Counted, not inferred. A pass that cached verdicts but merged nothing looks
+            // identical to a pass that never ran unless the steps are reported.
+            if let diagnostics = appState.aiDiagnostics {
+                Text(diagnostics)
+                    .font(.caption2)
+                    .foregroundStyle(diagnostics.contains("FAILED") ? .red : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+            }
+
             Label(
                 "A model verdict can only ever make mail safer. Moving mail toward deletion always requires the local rules to agree.",
                 systemImage: "lock.shield"
@@ -326,15 +449,25 @@ struct SettingsView: View {
                 .foregroundStyle(.secondary)
 
             HStack(spacing: 12) {
-                Button("Re-categorize all mail") {
+                Button {
                     Task {
                         if let accountId = appState.selectedAccount?.id {
                             await appState.recategorizeAll(accountId: accountId)
                             await appState.applySenderRules(accountId: accountId)
                         }
                     }
+                } label: {
+                    if appState.isRecategorizing {
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small)
+                            Text("Working…")
+                        }
+                    } else {
+                        Text("Re-categorize all mail")
+                    }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(appState.isRecategorizing || appState.selectedAccount == nil)
 
                 Button("Re-apply sender rules") {
                     Task {
@@ -344,6 +477,23 @@ struct SettingsView: View {
                     }
                 }
                 .buttonStyle(.bordered)
+                .disabled(appState.isRecategorizing)
+            }
+
+            if appState.selectedAccount == nil {
+                Text("Select an account in the sidebar first — these act on one account.")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+            }
+
+            // Outcome, stated explicitly. Previously this ran and reported nothing at
+            // all, so a successful run and a dead button looked identical.
+            if let status = appState.maintenanceStatus {
+                Text(status)
+                    .font(.caption)
+                    .foregroundStyle(status.contains("failed") ? .red : .secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if appState.lastRuleMatchCount > 0 {

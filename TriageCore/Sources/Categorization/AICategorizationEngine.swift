@@ -14,6 +14,29 @@ import Foundation
 ///    user one unnecessary manual review, never a deleted receipt. This is enforced
 ///    here in code rather than requested in the prompt, because a prompt is not a
 ///    guarantee.
+/// What one AI categorization pass actually did.
+///
+/// Exists because the engine's effect was being inferred from stored reasons and got it
+/// wrong: 22 verdicts were cached while zero emails carried AI attribution, and no
+/// amount of reading the code settled why. Counting the steps is cheaper than guessing.
+public struct AIRunDiagnostics: Sendable {
+    public var sendersConsidered = 0
+    public var verdictsFromCache = 0
+    public var batchesRequested = 0
+    public var verdictsReturned = 0
+    public var mergesApplied = 0
+    public var failure: String?
+
+    public var summary: String {
+        if let failure {
+            return "AI pass FAILED after \(verdictsReturned) verdicts: \(failure)"
+        }
+        return "AI: \(sendersConsidered) ambiguous senders, "
+            + "\(verdictsFromCache) cached + \(verdictsReturned) fetched in \(batchesRequested) call(s), "
+            + "\(mergesApplied) emails merged."
+    }
+}
+
 public final class AICategorizationEngine: CategorizationEngine {
 
     /// Rule results at or above this confidence are accepted as-is and never sent to
@@ -28,22 +51,54 @@ public final class AICategorizationEngine: CategorizationEngine {
     private let cache: SenderVerdictCaching
     private let accountId: Int64
     private let sampleSubjects: (String) async -> [String]
+    /// Absent unless the user enabled sending body previews. Deliberately optional rather
+    /// than a flag: when disabled there is no code path that reads message content.
+    private let sampleSnippets: ((String) async -> [String])?
+    /// The user's corrections, re-read per run so a fix made a moment ago reaches the very
+    /// next batch.
+    private let correctionExamples: () async -> [CorrectionExample]
+    /// Reports what the pass did. Called once per `categorize`, success or failure.
+    private let onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)?
 
     public init(
         rules: RuleBasedEngine,
         transport: LLMTransport,
         cache: SenderVerdictCaching,
         accountId: Int64,
-        sampleSubjects: @escaping (String) async -> [String] = { _ in [] }
+        sampleSubjects: @escaping (String) async -> [String] = { _ in [] },
+        sampleSnippets: ((String) async -> [String])? = nil,
+        correctionExamples: @escaping () async -> [CorrectionExample] = { [] },
+        onDiagnostics: (@Sendable (AIRunDiagnostics) -> Void)? = nil
     ) {
         self.rules = rules
         self.transport = transport
         self.cache = cache
         self.accountId = accountId
         self.sampleSubjects = sampleSubjects
+        self.sampleSnippets = sampleSnippets
+        self.correctionExamples = correctionExamples
+        self.onDiagnostics = onDiagnostics
     }
 
     public func categorize(emails: [EmailMetadata]) async throws -> [CategorizationResult] {
+        var diagnostics = AIRunDiagnostics()
+        do {
+            let results = try await runCategorize(emails: emails, diagnostics: &diagnostics)
+            onDiagnostics?(diagnostics)
+            return results
+        } catch {
+            // Report BEFORE rethrowing. Without this a mid-pass failure looks identical
+            // to the AI having no effect, which is exactly what happened.
+            diagnostics.failure = error.localizedDescription
+            onDiagnostics?(diagnostics)
+            throw error
+        }
+    }
+
+    private func runCategorize(
+        emails: [EmailMetadata],
+        diagnostics: inout AIRunDiagnostics
+    ) async throws -> [CategorizationResult] {
         let ruleResults = try await rules.categorize(emails: emails)
         guard !emails.isEmpty else { return ruleResults }
 
@@ -57,6 +112,7 @@ public final class AICategorizationEngine: CategorizationEngine {
             emails: emails,
             ruleResults: resultsById
         )
+        diagnostics.sendersConsidered = ambiguousSenders.count
         guard !ambiguousSenders.isEmpty else { return ruleResults }
 
         // Cached verdicts cost nothing — a rescan should not re-pay for a sender
@@ -67,12 +123,16 @@ public final class AICategorizationEngine: CategorizationEngine {
             modelId: transport.modelId,
             promptVersion: transport.promptVersion
         )
+        diagnostics.verdictsFromCache = verdicts.count
 
         let uncached = ambiguousSenders.filter { verdicts[$0] == nil }
         if !uncached.isEmpty {
             let requests = await buildRequests(for: uncached, emails: emails)
+            let learned = await correctionExamples()
             for batch in requests.chunked(into: Self.batchSize) {
-                let fresh = try await transport.classify(senders: batch)
+                diagnostics.batchesRequested += 1
+                let fresh = try await transport.classify(senders: batch, corrections: learned)
+                diagnostics.verdictsReturned += fresh.count
                 try await cache.storeVerdicts(
                     fresh,
                     accountId: accountId,
@@ -89,7 +149,17 @@ public final class AICategorizationEngine: CategorizationEngine {
         for email in emails {
             guard let ruleResult = resultsById[email.messageId] else { continue }
             guard let verdict = verdicts[email.senderEmail.lowercased()] else { continue }
-            resultsById[email.messageId] = Self.merge(rule: ruleResult, verdict: verdict)
+            resultsById[email.messageId] = Self.merge(
+                rule: ruleResult,
+                // Resolved PER MESSAGE. Where the model named a subject split, this is
+                // where a mixed sender stops being one answer and becomes two: the
+                // marketing half and the receipts half of the same address get different
+                // verdicts from a single sender-level call.
+                verdict: verdict.resolved(forSubject: email.subject),
+                // Also per message: the provider labelled each one individually.
+                providerCategory: email.providerCategory
+            )
+            diagnostics.mergesApplied += 1
         }
 
         // Preserve input order.
@@ -98,10 +168,15 @@ public final class AICategorizationEngine: CategorizationEngine {
 
     // MARK: - Selection
 
-    /// Senders whose mail the rules could not confidently resolve.
+    /// Senders whose mail the rules could not resolve on STRONG evidence.
     ///
-    /// Protected mail is excluded: a contact is already settled, and there is no
-    /// verdict the model could return that would improve on that.
+    /// Deliberately not a confidence threshold any more. Confidence is a hand-assigned
+    /// literal, so a baseless 0.85 used to outrank the model and keep whole categories of
+    /// mail away from the only component that could read them — measurably so on a
+    /// non-English mailbox, where 80% of decisions came from heuristics.
+    ///
+    /// Protected mail is still excluded: a contact is already settled, and no verdict
+    /// could improve on that.
     static func sendersNeedingClassification(
         emails: [EmailMetadata],
         ruleResults: [String: CategorizationResult]
@@ -110,7 +185,7 @@ public final class AICategorizationEngine: CategorizationEngine {
         for email in emails {
             guard let result = ruleResults[email.messageId] else { continue }
             if result.safetyTier == .protected_ { continue }
-            if result.category == .unknown || result.confidence < ruleConfidenceCeiling {
+            if !result.evidence.canAutoAction {
                 senders.insert(email.senderEmail.lowercased())
             }
         }
@@ -150,11 +225,32 @@ public final class AICategorizationEngine: CategorizationEngine {
                     sampleSubjects: Array(subjects),
                     totalEmails: senderEmails.count,
                     hasUnsubscribe: senderEmails.contains(where: \.hasListUnsubscribe),
-                    averageIntervalDays: interval
+                    averageIntervalDays: interval,
+                    // Only fetched when the user has allowed it. The closure is absent
+                    // rather than returning empty when disabled, so the code path that
+                    // reads message content does not exist unless it was turned on.
+                    sampleSnippets: await sampleSnippets?(sender) ?? [],
+                    // Counted from the mail already in hand rather than queried: the
+                    // provider's own labels are the strongest available hint that a sender
+                    // is mixed, and a mixed sender is one the model should split.
+                    providerLabelCounts: Self.providerCounts(of: senderEmails),
+                    userHasReplied: senderEmails.contains {
+                        $0.labels?.contains("SENT") ?? false
+                    }
                 )
             )
         }
         return requests
+    }
+
+    static func providerCounts(of emails: [EmailMetadata]) -> [String: Int] {
+        var counts: [String: Int] = [:]
+        for email in emails {
+            if let category = email.providerCategory {
+                counts[category.displayName, default: 0] += 1
+            }
+        }
+        return counts
     }
 
     // MARK: - Merge
@@ -164,30 +260,86 @@ public final class AICategorizationEngine: CategorizationEngine {
     /// The tier is `max(ruleTier, verdictTier)` on the strictness ordering. So the model
     /// can promote mail to review or protected on its own authority, but moving mail
     /// toward deletion requires the rules to already agree it is safe.
-    static func merge(rule: CategorizationResult, verdict: SenderVerdict) -> CategorizationResult {
+    static func merge(
+        rule: CategorizationResult,
+        verdict: SenderVerdict,
+        providerCategory: ProviderCategory? = nil
+    ) -> CategorizationResult {
+        // A contact outranks any verdict, and nothing here may weaken that.
+        guard rule.safetyTier != .protected_ else { return rule }
+
+        // An abstention is an ABSENCE of a verdict, not a verdict, so it may not move the
+        // tier in either direction — it has nothing to move it with. Letting it do so was a
+        // real regression: the model's "this sender is mixed and this subject matched
+        // neither of my patterns" was raising safety over mail that BOTH the rules and the
+        // provider had independently called marketing, which held 48 emails out of the
+        // actionable tier and left the app unable to clean anything.
+        //
+        // Mail the rules were also unsure about is unaffected: its tier is already review,
+        // so leaving it untouched is the same outcome by a more honest route.
+        if verdict.isUnsure {
+            return CategorizationResult(
+                messageId: rule.messageId,
+                category: rule.category,
+                safetyTier: rule.safetyTier,
+                confidence: rule.confidence,
+                reason: rule.reason + " — the model had no read on this message",
+                evidence: rule.evidence
+            )
+        }
+
         let ruleRank = strictness(rule.safetyTier)
         let verdictRank = strictness(verdict.impliedTier)
-        let finalTier = verdictRank > ruleRank ? verdict.impliedTier : rule.safetyTier
 
-        // The model only runs where the rules were unconfident, so its category is
-        // preferred — but a rule result that was already confident keeps its category.
-        let useVerdictCategory = rule.category == .unknown
-            || rule.confidence < AICategorizationEngine.ruleConfidenceCeiling
+        // Narrowing-only applies to findings the rules actually EARNED. A weak finding is
+        // provisional — the invariant parked it in review because the rules did not know —
+        // so a verdict may resolve it in either direction.
+        //
+        // But a verdict alone may not authorise DELETION. The principle is that no single
+        // fallible source gets to do that: an explicit domain list may, because it is
+        // near-certain and language-independent; one model call may not, because a
+        // hallucinated "disposable" would cost a real receipt. So loosening requires the
+        // provider to independently agree the mail is bulk marketing — two unrelated
+        // classifiers reaching the same conclusion, one of which read the message.
+        //
+        // Both failure modes here have already happened. Applying narrowing to provisional
+        // findings froze the whole mailbox in review (1 of 403 actionable, including 104
+        // the model had correctly called marketing). Letting the model loosen freely is
+        // what the test guarding this line was written to prevent.
+        let finalTier: SafetyTier
+        if rule.evidence.canAutoAction {
+            finalTier = verdictRank > ruleRank ? verdict.impliedTier : rule.safetyTier
+        } else if verdictRank > ruleRank {
+            // Raising safety never needs a second opinion.
+            finalTier = verdict.impliedTier
+        } else if verdict.impliedTier == .safe && providerCategory?.isBulkMarketing == true {
+            finalTier = .safe
+        } else {
+            finalTier = rule.safetyTier
+        }
+
+        let useVerdictCategory = !rule.evidence.canAutoAction
         let finalCategory = useVerdictCategory ? verdict.category : rule.category
 
-        let reason = useVerdictCategory
-            ? "AI: \(verdict.reason)"
-            : rule.reason
-        let tierNote = finalTier != rule.safetyTier && finalTier == verdict.impliedTier
-            ? " (AI raised safety)"
-            : ""
+        let reason = useVerdictCategory ? "AI: \(verdict.reason)" : rule.reason
+        let tierNote: String
+        if finalTier != rule.safetyTier && verdictRank > ruleRank {
+            tierNote = " (AI raised safety)"
+        } else if finalTier == .safe && rule.safetyTier != .safe {
+            tierNote = " (AI and Gmail agree it is bulk marketing)"
+        } else {
+            tierNote = ""
+        }
 
         return CategorizationResult(
             messageId: rule.messageId,
             category: finalCategory,
             safetyTier: finalTier,
             confidence: useVerdictCategory ? verdict.confidence : rule.confidence,
-            reason: reason + tierNote
+            reason: reason + tierNote,
+            // A verdict counts as strong evidence: something read the mail, rather than
+            // pattern-matching its envelope.
+            evidence: useVerdictCategory ? .strong : rule.evidence
         )
     }
 

@@ -46,6 +46,19 @@ final class AppState: ObservableObject {
     /// count in the UI is zero too.
     @Published var knownContactCount = 0
     @Published var isRefreshingContacts = false
+    @Published var isReconnecting = false
+    /// Progress and outcome of the maintenance actions, so they are never silent.
+    @Published var isRecategorizing = false
+    @Published var maintenanceStatus: String?
+    /// What the last AI pass actually did, counted rather than inferred.
+    @Published var aiDiagnostics: String?
+    /// The user's own corrections for the selected account, kept in memory because every
+    /// categorization pass consults them.
+    @Published var corrections: [UserCorrection] = []
+    @Published var correctionStatus: String?
+    /// Contact detection failing is a narrower problem than the scan failing, and is
+    /// reported separately so the two are not confused.
+    @Published var contactDetectionWarning: String?
     /// Live progress while an action plan runs. Nil when idle.
     @Published var executionProgress: ExecutionProgress?
     @Published var actionHistory: [ActionLog] = []
@@ -54,6 +67,10 @@ final class AppState: ObservableObject {
     private let database: AppDatabase
     private let contactDetector: ContactDetector
     private let unsubscribeService = UnsubscribeService()
+    /// ONE auth service for the app's lifetime. Constructing a fresh one per call threw
+    /// away its in-process token cache, so every scan re-authorised against the
+    /// Keychain and produced another password prompt.
+    let authService = GmailAuthService(clientId: Secrets.gmailClientId)
     private var gmailService: GmailService?
     private var batchExecutor: BatchExecutor?
 
@@ -67,6 +84,25 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// The account a scan would act on.
+    ///
+    /// Falls back to the first account when the sidebar has no selection, so the toolbar
+    /// action is never dead just because a selection was lost — which is exactly how the
+    /// old in-view Scan button became unreachable.
+    var scanTarget: EmailAccount? {
+        selectedAccount ?? accounts.first
+    }
+
+    /// Scan whichever account is targeted, selecting it first so the UI agrees with what
+    /// is being scanned.
+    func scanSelectedAccount() async {
+        guard let account = scanTarget else { return }
+        if selectedAccount?.id != account.id {
+            selectedAccount = account
+        }
+        await startGmailScan(for: account)
+    }
+
     func loadAccounts() async {
         do {
             accounts = try await database.fetchAllAccounts()
@@ -78,6 +114,7 @@ final class AppState: ObservableObject {
     func startGmailScan(for account: EmailAccount) async {
         guard !isScanning else { return }
         isScanning = true
+        contactDetectionWarning = nil
         scanProgress = ScanProgress(total: 0, fetched: 0, status: .connecting)
 
         defer { isScanning = false }
@@ -85,7 +122,6 @@ final class AppState: ObservableObject {
         do {
             // Ensure Gmail service is configured
             if gmailService == nil {
-                let authService = GmailAuthService(clientId: Secrets.gmailClientId)
                 let tokens = try await authService.getValidTokens()
                 configureGmail(with: tokens)
             }
@@ -152,14 +188,28 @@ final class AppState: ObservableObject {
                 sentMailContacts: sentContacts
             )
             knownContactCount = contacts.count
+
+            // Succeeding with nothing is its own problem and must not pass silently:
+            // an empty contact set means the protected tier is empty, which is the
+            // condition the whole safety model depends on NOT being true.
+            if contacts.isEmpty {
+                contactDetectionWarning = "No contacts found. Searched \(account.email)'s "
+                    + "sent mail (\(sentContacts.count) correspondents) and Gmail's own "
+                    + "personal-mail labels, and both came back empty. Pin senders by hand "
+                    + "from the Senders view until this is resolved."
+            }
         } catch {
             // Fall back to whatever was persisted previously rather than an empty set.
+            //
+            // Reported through a SEPARATE channel, not scanProgress.status: marking the
+            // scan itself failed here would claim the mail fetch broke when it in fact
+            // succeeded, and the distinction matters because the consequence is narrow —
+            // the protected tier is weaker than it should be, not that nothing scanned.
             let fallback = (try? await contactDetector.loadPersistedContacts(accountId: accountId)) ?? []
             knownContactCount = fallback.count
-            scanProgress?.status = .failed(
-                "Contact detection failed (\(error.localizedDescription)). "
-                + "Using \(fallback.count) previously-saved contacts — review the plan carefully."
-            )
+            contactDetectionWarning = "Contact detection failed (\(error.localizedDescription)). "
+                + "Using \(fallback.count) previously-saved contacts — review the plan carefully, "
+                + "because fewer contacts means less mail is protected."
         }
     }
 
@@ -196,13 +246,25 @@ final class AppState: ObservableObject {
     /// Needed after the contact list changes, since previously-categorized mail
     /// was judged against the older (possibly empty) contact set.
     func recategorizeAll(accountId: Int64) async {
+        isRecategorizing = true
+        maintenanceStatus = "Re-categorizing…"
+        defer { isRecategorizing = false }
+
         do {
             let contacts = try await contactDetector.loadPersistedContacts(accountId: accountId)
             knownContactCount = contacts.count
             if settings == nil { await loadSettings(accountId: accountId) }
 
             let all = try await database.fetchEmails(accountId: accountId, limit: 50000, offset: 0)
-            guard !all.isEmpty else { return }
+            guard !all.isEmpty else {
+                maintenanceStatus = "Nothing to re-categorize for this account."
+                return
+            }
+
+            let usingAI = settings?.aiConfig.isEnabled == true
+            maintenanceStatus = usingAI
+                ? "Re-categorizing \(all.count) emails (cloud enabled)…"
+                : "Re-categorizing \(all.count) emails…"
 
             let results = try await categorizeWithFallback(
                 emails: all,
@@ -211,8 +273,26 @@ final class AppState: ObservableObject {
             )
             try await database.updateCategories(results, accountId: accountId)
             accountStats = try await database.accountStats(accountId: accountId)
+
+            // Report what actually changed. A maintenance action that runs silently is
+            // indistinguishable from a button that does nothing.
+            let aiInfluenced = results.filter { $0.reason.contains("AI") }.count
+            var summary = "Re-categorized \(results.count) emails "
+                + "using \(contacts.count) contacts."
+            if usingAI {
+                let verdicts = (try? await database.cachedVerdictCount(
+                    accountId: accountId,
+                    modelId: settings?.aiConfig.modelId.isEmpty == false
+                        ? settings!.aiConfig.modelId
+                        : BedrockLLMTransport.defaultModelId,
+                    promptVersion: SenderClassificationPrompt.version
+                )) ?? 0
+                summary += " Cloud verdicts cached: \(verdicts). "
+                    + "Decisions citing the model: \(aiInfluenced)."
+            }
+            maintenanceStatus = summary
         } catch {
-            print("Recategorization failed: \(error)")
+            maintenanceStatus = "Re-categorization failed: \(error.localizedDescription)"
         }
     }
 
@@ -242,6 +322,53 @@ final class AppState: ObservableObject {
             actionPlan = planner.generatePlan(emails: emails, accountId: accountId)
         } catch {
             print("Plan generation failed: \(error)")
+        }
+    }
+
+    /// Re-run OAuth for an account that already exists, WITHOUT touching its data.
+    ///
+    /// Necessary because Google expires refresh tokens after 7 days while the OAuth
+    /// consent screen is in testing mode, so an account stops working periodically and
+    /// needs fresh consent.
+    ///
+    /// The obvious workaround — remove the account and add it again — is destructive and
+    /// does not even work: `deleteAccount` cascades to `emailMetadata` and would discard
+    /// every scanned message, and re-adding then fails on the UNIQUE constraint on
+    /// `email`. This path keeps the row and its mail and only replaces the credentials.
+    @MainActor
+    func reconnectAccount(_ account: EmailAccount) async {
+        isReconnecting = true
+        lastExecutionError = nil
+        defer { isReconnecting = false }
+
+        do {
+            let tokens = try await authService.authenticate()
+
+            // Verify the Google account that just signed in is the one being repaired.
+            // Without this, signing in as the wrong account silently stores a token that
+            // does not match the row, and the next scan reads someone else's mailbox.
+            let rateLimiter = RateLimiter(maxRequestsPerSecond: 45)
+            let client = GmailAPIClient(
+                tokens: tokens,
+                rateLimiter: rateLimiter,
+                retryPolicy: RetryPolicy()
+            )
+            let profile = try await client.getProfile()
+
+            guard profile.emailAddress.lowercased() == account.email.lowercased() else {
+                lastExecutionError = "You signed in as \(profile.emailAddress), but this "
+                    + "account is \(account.email). Nothing was changed — reconnect again "
+                    + "and choose \(account.email)."
+                try? authService.signOut()
+                return
+            }
+
+            configureGmail(with: tokens)
+            selectedAccount = account
+            // Clear the stale failure so the banner does not outlive the problem.
+            scanProgress = nil
+        } catch {
+            lastExecutionError = "Reconnect failed: \(error.localizedDescription)"
         }
     }
 
@@ -515,6 +642,106 @@ final class AppState: ObservableObject {
         sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
     }
 
+    // MARK: - Corrections
+
+    func loadCorrections(accountId: Int64) async {
+        do {
+            corrections = try await database.corrections(accountId: accountId)
+        } catch {
+            corrections = []
+            correctionStatus = "Could not load corrections: \(error.localizedDescription)"
+        }
+    }
+
+    /// Record that the app got a categorization wrong, and act on it immediately.
+    ///
+    /// Re-categorizes only the affected sender rather than the whole mailbox. A correction
+    /// has to visibly take effect at once: making the user wait through a full pass to see
+    /// their own instruction applied is how a feature like this stops being used.
+    func correctCategory(
+        for email: EmailMetadata,
+        to category: EmailCategory,
+        mustKeep: Bool,
+        scopeToSubjectPattern pattern: String? = nil
+    ) async {
+        let accountId = email.accountId
+
+        let correction = UserCorrection(
+            accountId: accountId,
+            senderEmail: email.senderEmail,
+            subjectPattern: pattern,
+            category: category,
+            mustKeep: mustKeep,
+            previousCategory: email.category,
+            previousTier: email.safetyTier,
+            previousReason: email.categoryReason
+        )
+
+        do {
+            try await database.saveCorrection(correction)
+            await loadCorrections(accountId: accountId)
+            let affected = try await recategorizeSender(
+                accountId: accountId,
+                senderEmail: email.senderEmail
+            )
+
+            var scope = email.senderEmail
+            if let pattern {
+                scope += " (subjects containing \"\(pattern)\")"
+            }
+            correctionStatus = "Set \(scope) to \(category.displayName)"
+                + (mustKeep ? ", protected" : "")
+                + " — \(affected) message\(affected == 1 ? "" : "s") updated."
+            // Sender rows carry the tier counts a correction changes, so they would
+            // otherwise show stale numbers until the next manual refresh.
+            await loadSenderSummaries(accountId: accountId)
+        } catch {
+            correctionStatus = "Could not save the correction: \(error.localizedDescription)"
+        }
+    }
+
+    /// Apply the current correction set to one sender's existing mail.
+    @discardableResult
+    private func recategorizeSender(accountId: Int64, senderEmail: String) async throws -> Int {
+        let emails = try await database.emails(accountId: accountId, senderEmail: senderEmail)
+        guard !emails.isEmpty else { return 0 }
+
+        let contacts = try await database.knownContactEmails(accountId: accountId)
+        let engine = makeEngine(accountId: accountId, contacts: contacts)
+        let results = try await engine.categorize(emails: emails)
+        try await database.updateCategories(results, accountId: accountId)
+        return results.count
+    }
+
+    /// Turn corrections into golden labels, so accuracy becomes measurable from ordinary
+    /// use rather than a separate labelling chore.
+    func promoteCorrectionsToLabels(accountId: Int64) async {
+        do {
+            let written = try await database.promoteCorrectionsToGoldenLabels(accountId: accountId)
+            await loadGoldenLabels(accountId: accountId)
+            correctionStatus = written == 0
+                ? "No sender-wide corrections to add. Subject-scoped ones can't become labels, since the evaluation set is keyed by sender."
+                : "Added \(written) correction\(written == 1 ? "" : "s") to the evaluation set."
+        } catch {
+            correctionStatus = "Could not update the evaluation set: \(error.localizedDescription)"
+        }
+    }
+
+    func removeCorrection(_ correction: UserCorrection) async {        guard let id = correction.id else { return }
+        do {
+            try await database.deleteCorrection(id: id)
+            await loadCorrections(accountId: correction.accountId)
+            let affected = try await recategorizeSender(
+                accountId: correction.accountId,
+                senderEmail: correction.senderEmail
+            )
+            correctionStatus = "Removed the correction for \(correction.senderEmail)"
+                + " — \(affected) message\(affected == 1 ? "" : "s") re-evaluated."
+        } catch {
+            correctionStatus = "Could not remove the correction: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Golden Set & Evaluation
 
     func loadGoldenLabels(accountId: Int64) async {
@@ -606,24 +833,47 @@ final class AppState: ObservableObject {
     /// Returns the rules-only engine unless cloud categorization is explicitly enabled.
     private func makeEngine(accountId: Int64, contacts: Set<String>) -> CategorizationEngine {
         let rules = RuleBasedEngine(knownContacts: contacts)
+        let db = database
 
-        guard let ai = settings?.aiConfig, ai.isEnabled else { return rules }
+        // Corrections wrap whatever sits beneath, so they outrank both the rules and the
+        // model, and apply even when the model is switched off.
+        func correcting(_ base: CategorizationEngine) -> CategorizationEngine {
+            guard !corrections.isEmpty else { return base }
+            return CorrectingEngine(base: base, corrections: corrections)
+        }
+
+        guard let ai = settings?.aiConfig, ai.isEnabled else { return correcting(rules) }
 
         let transport = BedrockLLMTransport(
             modelId: ai.modelId.isEmpty ? BedrockLLMTransport.defaultModelId : ai.modelId,
             region: ai.region.isEmpty ? nil : ai.region
         )
 
-        let db = database
-        return AICategorizationEngine(
+        let engine = AICategorizationEngine(
             rules: rules,
             transport: transport,
             cache: db,
             accountId: accountId,
             sampleSubjects: { sender in
                 (try? await db.sampleSubjects(accountId: accountId, senderEmail: sender)) ?? []
+            },
+            // Absent unless explicitly enabled, so there is no path that reads message
+            // content without the user having asked for it.
+            sampleSnippets: ai.sendBodyPreviews
+                ? { sender in
+                    (try? await db.sampleSnippets(accountId: accountId, senderEmail: sender)) ?? []
+                }
+                : nil,
+            correctionExamples: {
+                (try? await db.correctionExamples(accountId: accountId)) ?? []
+            },
+            onDiagnostics: { [weak self] diagnostics in
+                Task { @MainActor in
+                    self?.aiDiagnostics = diagnostics.summary
+                }
             }
         )
+        return correcting(engine)
     }
 
     /// Categorize with the configured engine, falling back to rules on failure.
@@ -785,7 +1035,6 @@ final class AppState: ObservableObject {
                 batchExecutor = nil
             }
             // Clear stored OAuth tokens
-            let authService = GmailAuthService(clientId: Secrets.gmailClientId)
             try? authService.signOut()
         } catch {
             print("Failed to delete account: \(error)")

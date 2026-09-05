@@ -9,6 +9,34 @@ public protocol CategorizationEngine: Sendable {
     func categorize(emails: [EmailMetadata]) async throws -> [CategorizationResult]
 }
 
+/// What kind of evidence a decision rests on.
+///
+/// This exists because confidence was doing a job it could not do. The confidence values
+/// are hand-assigned literals — 0.85 for a domain-list hit, 0.7 for an English subject
+/// keyword — and nothing measured them. Using a numeric threshold to decide when to ask
+/// the AI therefore meant a baseless 0.85 outranked the one component able to read the
+/// mail, which is how a Dutch water bill became an auto-actionable newsletter.
+///
+/// Measured on a real 403-email mailbox: only 20% of decisions rested on structural
+/// evidence. The rest came from an unsubscribe header, a `noreply@` prefix, or an
+/// English keyword in a substantially Dutch inbox.
+public enum EvidenceStrength: String, Sendable, Codable, Equatable {
+    /// The sender is explicitly known: a listed domain, a marketing platform, a contact.
+    /// Language-independent and safe to act on.
+    case strong
+    /// A heuristic fired, but it says little about whether the mail matters. An
+    /// unsubscribe header proves BULK not DISPOSABLE; `noreply@` proves nobody reads
+    /// replies, not that the content is worthless; an English keyword proves nothing at
+    /// all in a mailbox that is not in English.
+    case weak
+    /// Nothing matched.
+    case none
+
+    /// Only strong evidence may put mail in the auto-actionable tier without a model or
+    /// a human having looked at it.
+    public var canAutoAction: Bool { self == .strong }
+}
+
 /// Result of categorizing a single email
 public struct CategorizationResult: Sendable {
     public let messageId: String
@@ -16,19 +44,23 @@ public struct CategorizationResult: Sendable {
     public let safetyTier: SafetyTier
     public let confidence: Double  // 0.0 - 1.0
     public let reason: String      // Human-readable reason for the categorization
+    /// What the decision actually rests on. Drives whether the AI is consulted.
+    public let evidence: EvidenceStrength
 
     public init(
         messageId: String,
         category: EmailCategory,
         safetyTier: SafetyTier,
         confidence: Double,
-        reason: String
+        reason: String,
+        evidence: EvidenceStrength = .weak
     ) {
         self.messageId = messageId
         self.category = category
         self.safetyTier = safetyTier
         self.confidence = confidence
         self.reason = reason
+        self.evidence = evidence
     }
 }
 
@@ -59,7 +91,181 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
 
     // MARK: - Core Classification Logic
 
+    /// Classify, then enforce the evidence invariant.
+    ///
+    /// A single chokepoint rather than trusting ~15 call sites to get the tier right:
+    /// the auto-actionable tier now REQUIRES strong evidence, so a heuristic can suggest
+    /// a category but cannot authorise acting on it. This is what stops the next
+    /// unexamined weak rule from quietly producing another deletable water bill.
     private func categorizeEmail(_ email: EmailMetadata) -> CategorizationResult {
+        let ruled = classify(email)
+        let languageChecked = Self.discountingEnglishPatternsOnForeignMail(ruled, email: email)
+        let corroborated = Self.weighingProviderOpinion(languageChecked, email: email)
+        return Self.enforcingEvidenceInvariant(corroborated)
+    }
+
+    /// Withdraw trust from a subject-derived verdict when the subject is not English.
+    ///
+    /// The engine's subject patterns are English strings, so on non-English mail a match is
+    /// as likely to be coincidence as comprehension. Rather than pretend otherwise, the
+    /// finding is kept as a suggestion and stripped of the authority to act — which also
+    /// pushes the sender to the model, the only component that can actually read it.
+    ///
+    /// Only SUBJECT-derived findings are affected. A listed domain means the same thing in
+    /// every language, so `chase.com` and `rabobank.nl` are untouched by this.
+    static func discountingEnglishPatternsOnForeignMail(
+        _ result: CategorizationResult,
+        email: EmailMetadata
+    ) -> CategorizationResult {
+        guard result.evidence == .strong,
+              result.reason.lowercased().contains("subject"),
+              subjectIsProbablyNotEnglish(email.subject)
+        else { return result }
+
+        return CategorizationResult(
+            messageId: result.messageId,
+            category: result.category,
+            safetyTier: result.safetyTier,
+            confidence: min(result.confidence, 0.55),
+            reason: result.reason
+                + " — but this subject is not in English, so an English keyword match "
+                + "proves little",
+            evidence: .weak
+        )
+    }
+
+    /// Reconcile our verdict with the mail provider's own.
+    ///
+    /// The provider is an independent classifier that works in every language, and it
+    /// already labelled every message before we looked at it. Where it agrees, we can act
+    /// with more confidence than either source alone justifies; where it contradicts us on
+    /// the axis that matters — is this mail disposable — it is the more credible of the
+    /// two, because our side is an English keyword list.
+    ///
+    /// Never used to make mail MORE deletable than the rules found it. A provider
+    /// promotions label is corroboration for auto-action only when our own rules
+    /// independently reached the same conclusion.
+    static func weighingProviderOpinion(
+        _ result: CategorizationResult,
+        email: EmailMetadata
+    ) -> CategorizationResult {
+        guard let provider = email.providerCategory else { return result }
+
+        // A contact is already settled by stronger evidence than any label.
+        if result.safetyTier == .protected_ { return result }
+
+        let weThinkDisposable = result.category == .promotion || result.category == .newsletter
+
+        // Contradiction on disposability: trust the provider, and say so.
+        //
+        // Keyed on the OUTCOME rather than a list of categories, because the list let cases
+        // through. A `social` match reached the auto-actionable tier without ever consulting
+        // the provider — found on the live mailbox as a YouTube Terms of Service notice that
+        // Gmail had filed under Updates. Harmless in itself, but the same path carries
+        // account-security alerts from social platforms, which are exactly the mail this
+        // veto exists to protect.
+        //
+        // The invariant is now simply: nothing the provider calls an Update or Personal is
+        // auto-actionable unless the user said so. User corrections are unaffected, since
+        // they are applied by a wrapper outside this engine.
+        if result.safetyTier == .safe && provider.arguesForKeeping {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: result.category,
+                safetyTier: .review,
+                confidence: 0.4,
+                reason: result.reason
+                    + " — but Gmail filed it under \(provider.displayName), which is where "
+                    + "bills and confirmations go, so this disagreement needs review",
+                evidence: .weak
+            )
+        }
+
+        // Independent agreement: two classifiers, one of them multilingual, same answer.
+        //
+        // This SETS the tier rather than preserving it. Preserving it was a real bug: the
+        // rules' tier is often `.review` only because their own evidence was weak, so
+        // inheriting it left corroborated mail in the worst possible place — no longer
+        // eligible for the model (it now counts as strong evidence) yet still not
+        // actionable. Measured on the live mailbox: 52 emails both classifiers agreed were
+        // marketing, all stuck in review, which is why the app could clean nothing.
+        //
+        // Two independent classifiers agreeing IS the evidence. Treating it as merely a
+        // relabelling wastes the only signal strong enough to act on without a model call.
+        if weThinkDisposable && provider.isBulkMarketing {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: result.category,
+                safetyTier: .safe,
+                confidence: max(result.confidence, 0.9),
+                reason: result.reason + " — and Gmail also filed it under Promotions",
+                evidence: .strong
+            )
+        }
+
+        if result.category == .social && provider == .social {
+            return CategorizationResult(
+                messageId: result.messageId,
+                category: .social,
+                safetyTier: .safe,
+                confidence: max(result.confidence, 0.9),
+                reason: result.reason + " — and Gmail also filed it under Social",
+                evidence: .strong
+            )
+        }
+
+        return result
+    }
+
+    static func enforcingEvidenceInvariant(_ result: CategorizationResult) -> CategorizationResult {
+        guard result.safetyTier == .safe, !result.evidence.canAutoAction else { return result }
+        return CategorizationResult(
+            messageId: result.messageId,
+            category: result.category,
+            safetyTier: .review,
+            // Cap the reported confidence too, so it cannot sit above the AI threshold
+            // and block the one component that can actually read this mail.
+            confidence: min(result.confidence, 0.6),
+            reason: result.reason + " — heuristic only, needs review",
+            evidence: result.evidence
+        )
+    }
+
+    /// Whether a subject is probably not in English.
+    ///
+    /// Crude on purpose — it only has to be right often enough to stop an English keyword
+    /// list being trusted on mail it cannot read. Function words are the signal: they are
+    /// short, extremely common, and unlike content words they do not migrate into other
+    /// languages' marketing copy.
+    ///
+    /// The failure this prevents is specific. An English pattern can match a non-English
+    /// subject by coincidence — a brand name, a loanword, a shared word like "sale" or
+    /// "offer" — and the match then carries the full confidence of a real hit. On a mailbox
+    /// where most mail is not English, that is a steady source of confident errors, and
+    /// each one also blocks the model from being consulted.
+    static func subjectIsProbablyNotEnglish(_ subject: String) -> Bool {
+        let lowered = subject.lowercased()
+
+        // Dutch, German, French, Spanish, Italian, Portuguese function words.
+        let markers = [
+            " uw ", " je ", " jouw ", " voor ", " van ", " het ", " een ", " naar ", " bij ",
+            " zijn ", " wordt ", " onze ",
+            " der ", " die ", " das ", " und ", " für ", " ihre ", " mit ", " sie ", " ihr ",
+            " von ", " zum ",
+            " le ", " la ", " les ", " des ", " pour ", " avec ", " vous ", " votre ", " sur ",
+            " el ", " los ", " las ", " para ", " con ", " sus ", " una ",
+            " il ", " lo ", " gli ", " per ", " con ", " sua ",
+            " do ", " da ", " dos ", " para ", " com ", " sua ",
+        ]
+        let padded = " \(lowered) "
+        if markers.contains(where: { padded.contains($0) }) { return true }
+
+        // Characters that do not occur in ordinary English text.
+        let nonEnglishScalars = CharacterSet(charactersIn: "àâäåæçèéêëìîïñòôöøùûüýÿßœ")
+        return lowered.unicodeScalars.contains { nonEnglishScalars.contains($0) }
+    }
+
+    private func classify(_ email: EmailMetadata) -> CategorizationResult {
         // Priority order of rules (first match wins):
         // 1. Known contact → PERSONAL + PROTECTED
         // 2. List-Unsubscribe header → NEWSLETTER
@@ -74,7 +280,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .personal,
                 safetyTier: .protected_,
                 confidence: 0.95,
-                reason: "From known contact"
+                reason: "From known contact",
+                evidence: .strong
             )
         }
 
@@ -164,7 +371,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .transactional,
                 safetyTier: .review,
                 confidence: 0.7,
-                reason: "Transactional sender with a List-Unsubscribe header"
+                reason: "Transactional sender with a List-Unsubscribe header",
+                evidence: .strong
             )
         }
 
@@ -175,17 +383,44 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .promotion,
                 safetyTier: .safe,
                 confidence: 0.9,
-                reason: "Promotional sender with List-Unsubscribe"
+                reason: "Promotional sender with List-Unsubscribe",
+                evidence: .strong
             )
         }
 
-        // Default: newsletter (has unsubscribe but not clearly promotional)
+        // Positive evidence of an actual newsletter keeps the auto-actionable tier, so
+        // genuine digests are still cleaned up without a review step.
+        let subject = email.subject.lowercased()
+        if let pattern = Self.newsletterSubjectPatterns.first(where: { subject.contains($0) }) {
+            return CategorizationResult(
+                messageId: email.messageId,
+                category: .newsletter,
+                safetyTier: .safe,
+                confidence: 0.85,
+                reason: "Newsletter subject (\"\(pattern)\") with List-Unsubscribe"
+            )
+        }
+
+        // Fallback: bulk mail from a sender we do not recognise.
+        //
+        // This used to return newsletter/.safe at 0.85, which was wrong twice over. A
+        // `List-Unsubscribe` header proves mail is BULK, not that it is DISPOSABLE —
+        // utilities, insurers and banks all send statements with one. Real example:
+        // "Jaarafrekening van waterbedrijf Vitens" (an annual water bill) from
+        // noreply@mail.vitens.nl was classified newsletter/.safe at 0.85 confidence.
+        //
+        // The high confidence made it worse than a mere mislabel: 0.85 sits above the
+        // AI engine's ambiguity threshold, so the sender was never sent for
+        // classification and the model — which reads Dutch perfectly well — never got
+        // the chance to correct it. Low confidence here is what routes these senders to
+        // the AI, and .review is what stops them being auto-actioned in the meantime.
         return CategorizationResult(
             messageId: email.messageId,
             category: .newsletter,
-            safetyTier: .safe,
-            confidence: 0.85,
-            reason: "Has List-Unsubscribe header"
+            safetyTier: .review,
+            confidence: 0.5,
+            reason: "Bulk mail (List-Unsubscribe) from an unrecognised sender — "
+                + "bulk does not mean disposable, so this needs review"
         )
     }
 
@@ -213,7 +448,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .transactional,
                 safetyTier: .review,
                 confidence: 0.75,
-                reason: "Transactional sender"
+                reason: "Transactional sender",
+                evidence: .strong
             )
         }
 
@@ -228,7 +464,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 confidence: 0.85,
                 reason: promoStrength == .platform
                     ? "Sent via a bulk-marketing platform"
-                    : "Known promotional sender domain"
+                    : "Known promotional sender domain",
+                evidence: .strong
             )
         }
 
@@ -239,7 +476,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .notification,
                 safetyTier: .safe,
                 confidence: 0.8,
-                reason: "Known notification sender"
+                reason: "Known notification sender",
+                evidence: .strong
             )
         }
 
@@ -249,7 +487,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .social,
                 safetyTier: .safe,
                 confidence: 0.9,
-                reason: "Social media platform"
+                reason: "Social media platform",
+                evidence: .strong
             )
         }
 
@@ -288,7 +527,13 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
                 category: .promotion,
                 safetyTier: .safe,
                 confidence: 0.8,
-                reason: "Mixed sender (\(domain)) with a promotional subject"
+                reason: "Mixed sender (\(domain)) with a promotional subject",
+                // Two independent signals agree: the domain is explicitly listed AND the
+                // subject is unambiguously promotional. That is the high-volume retailer
+                // case, and losing it would gut the app's automatic cleanup for no
+                // safety gain — order confirmations from these same senders are caught
+                // by the transactional check above.
+                evidence: .strong
             )
         }
 

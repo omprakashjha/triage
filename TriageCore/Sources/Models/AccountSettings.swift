@@ -73,18 +73,46 @@ public struct AIConfig: Codable, Sendable, Equatable {
     /// OVERRIDES the profile, which is rarely what someone wants.
     public var region: String
 
-    public init(isEnabled: Bool = false, modelId: String = "", region: String = "") {
+    /// Whether to send a short body preview per sender.
+    ///
+    /// Off by default and asked for separately from enabling the model at all, because it
+    /// is a different question. Consenting to send subject lines is consenting to send
+    /// metadata; consenting to send the first line of a message body is consenting to send
+    /// content. Bundling the two would obtain the second by implying it followed from the
+    /// first.
+    ///
+    /// It genuinely helps: subjects are often opaque ("Uw overzicht", "Your statement")
+    /// where the opening line is not. That is a reason to offer it, not a reason to assume
+    /// the answer.
+    public var sendBodyPreviews: Bool
+
+    public init(
+        isEnabled: Bool = false,
+        modelId: String = "",
+        region: String = "",
+        sendBodyPreviews: Bool = false
+    ) {
         self.isEnabled = isEnabled
         self.modelId = modelId
         self.region = region
+        self.sendBodyPreviews = sendBodyPreviews
     }
 
     /// What actually leaves the machine when this is on. Shown to the user verbatim.
     public static let egressDescription = """
-        Sender address, display name, message counts, how often they write, and up to \
-        five subject lines per sender. Message bodies are never sent — the app does not \
-        fetch them at all. Only senders the local rules could not resolve are sent, and \
-        each sender is sent at most once per model and prompt version.
+        Sender address, display name, message counts, how often they write, whether you \
+        have replied, which folder your mail provider filed them under, and up to eight \
+        subject lines per sender. Only senders the local rules could not resolve are \
+        sent, and each sender is sent at most once per model and prompt version.
+        """
+
+    /// The additional disclosure for body previews, kept separate so it cannot be skimmed
+    /// past as part of the paragraph above.
+    public static let bodyPreviewEgressDescription = """
+        Also sends up to three short body previews per sender — roughly the first 200 \
+        characters of a message, the same text your mail app shows in its list. This is \
+        message CONTENT rather than metadata. Full message bodies are never fetched or \
+        sent, but do not enable this if any of your mail is confidential.
         """
 }
 

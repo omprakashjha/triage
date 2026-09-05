@@ -36,7 +36,10 @@ final class RuleBasedEngineTests: XCTestCase {
 
     // MARK: - List-Unsubscribe (Rule 2)
 
-    func testListUnsubscribeIsNewsletter() async throws {
+    func testListUnsubscribeAloneIsNotAutoActionable() async throws {
+        // An unsubscribe header proves the mail is BULK, not that it is disposable.
+        // From an unrecognised sender with no other signal, that must not be
+        // auto-actionable — and the low confidence is what sends the sender to the AI.
         let email = makeEmail(
             senderEmail: "updates@randomsite.com",
             subject: "Your weekly update",
@@ -45,7 +48,44 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .newsletter)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertLessThan(results[0].confidence, 0.7, "must fall below the AI ambiguity threshold")
+    }
+
+    func testNewsletterSubjectSuggestsCategoryButNotAutoAction() async throws {
+        // A literal "weekly digest" is a useful hint, but it is still an ENGLISH keyword
+        // and this mailbox is substantially Dutch — so it names the category without
+        // authorising action on it. The sender triage screen is where bulk approval
+        // belongs, rather than a keyword the mailbox may never contain.
+        let email = makeEmail(
+            senderEmail: "editor@somesite.com",
+            subject: "Weekly digest: what happened",
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .newsletter)
+        XCTAssertEqual(results[0].safetyTier, .review)
+    }
+
+    func testDutchUtilityBillIsNotTreatedAsDisposableNewsletter() async throws {
+        // Real regression: "Jaarafrekening van waterbedrijf Vitens" (an annual water
+        // bill) from noreply@mail.vitens.nl was classified newsletter/.safe at 0.85.
+        // Every English subject pattern misses it, the sender is unlisted, and the
+        // `mail.` subdomain is only a generic transport signal — so the unsubscribe
+        // fallback decided it, confidently and wrongly.
+        let email = makeEmail(
+            senderEmail: "noreply@mail.vitens.nl",
+            subject: "Jaarafrekening van waterbedrijf Vitens",
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe, "a utility bill must not be auto-actionable")
+        XCTAssertLessThan(
+            results[0].confidence, 0.7,
+            "must be low enough that the AI is asked, since the rules cannot read Dutch"
+        )
     }
 
     func testListUnsubscribeFromPromoIsPromo() async throws {
@@ -143,7 +183,11 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .notification)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        // NOT .safe any more, and this is the Vitens lesson generalised: `noreply@`
+        // proves nobody reads replies, not that the content is disposable. The water
+        // bill that started this was noreply@mail.vitens.nl.
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertEqual(results[0].evidence, .weak)
     }
 
     func testNotificationsPrefix() async throws {
@@ -277,8 +321,11 @@ final class RuleBasedEngineTests: XCTestCase {
         let email = makeEmail(senderEmail: "no-reply@someservice.com", subject: "Scheduled maintenance")
         let results = try await engine.categorize(emails: [email])
 
+        // The token still matches — that is what this test is about — but matching it no
+        // longer authorises auto-action, because an unattended mailbox says nothing about
+        // whether the content matters.
         XCTAssertEqual(results[0].category, .notification)
-        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].safetyTier, .review)
     }
 
     // MARK: - Helpers
@@ -345,5 +392,188 @@ final class SenderPatternDatabaseTests: XCTestCase {
         XCTAssertTrue(patterns.isTransactionalDomain("chase.com"))
         XCTAssertTrue(patterns.isTransactionalDomain("paypal.com"))
         XCTAssertFalse(patterns.isTransactionalDomain("randomshop.com"))
+    }
+}
+
+// MARK: - The mail provider's own opinion
+
+/// Gmail labels every message with exactly one `CATEGORY_*`, in any language, before this
+/// app looks at it. These tests pin how that second opinion is used — as a veto when it
+/// contradicts us about disposability, as corroboration when it agrees, and never as a
+/// licence to delete more than the rules found on their own.
+final class ProviderCategorySignalTests: XCTestCase {
+    private var engine: RuleBasedEngine!
+
+    override func setUp() {
+        super.setUp()
+        engine = RuleBasedEngine()
+    }
+
+    private func makeEmail(
+        senderEmail: String,
+        subject: String,
+        labels: [String],
+        hasListUnsubscribe: Bool = false
+    ) -> EmailMetadata {
+        var email = EmailMetadata(
+            accountId: 1,
+            messageId: UUID().uuidString,
+            threadId: "t",
+            sender: "Sender <\(senderEmail)>",
+            senderEmail: senderEmail,
+            subject: subject,
+            date: Date(),
+            hasListUnsubscribe: hasListUnsubscribe
+        )
+        email.labels = labels
+        return email
+    }
+
+    func testUpdatesLabelVetoesAutoAction() async throws {
+        // The real case in miniature: the rules say promotional, Gmail says Updates —
+        // the bucket bills and confirmations land in. Measured on a live mailbox, 76 of
+        // the 122 emails the rules called promotional were labelled Updates by Gmail.
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Bekijk onze aanbiedingen",
+            labels: ["INBOX", "UNREAD", "CATEGORY_UPDATES"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(
+            results[0].safetyTier, .review,
+            "a disagreement about disposability must not resolve itself by guessing"
+        )
+        XCTAssertEqual(results[0].evidence, .weak)
+        XCTAssertTrue(results[0].reason.contains("Updates"))
+    }
+
+    func testPromotionsLabelCorroboratesAutoAction() async throws {
+        // The other direction matters just as much: independent agreement restores the
+        // cleanup power that requiring strong evidence would otherwise have cost.
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Weekend sale",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertEqual(results[0].evidence, .strong)
+        XCTAssertGreaterThanOrEqual(results[0].confidence, 0.9)
+    }
+
+    func testLabelNeverMakesMailMoreDeletable() async throws {
+        // A promotions label must not override a transactional finding. The provider
+        // corroborates a conclusion the rules already reached; it is not a licence.
+        let email = makeEmail(
+            senderEmail: "noreply@chase.com",
+            subject: "Your statement is ready",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .transactional)
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    func testLabelDoesNotOverrideAKnownContact() async throws {
+        let contactEngine = RuleBasedEngine(knownContacts: ["friend@example.com"])
+        let email = makeEmail(
+            senderEmail: "friend@example.com",
+            subject: "Sale on now",
+            labels: ["CATEGORY_PROMOTIONS"]
+        )
+        let results = try await contactEngine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .protected_)
+    }
+
+    func testCorroborationLiftsAProvisionalReviewToActionable() async throws {
+        // Regression. Corroboration used to PRESERVE the rules' tier, which was `.review`
+        // only because their own evidence was weak — so agreed-upon marketing was neither
+        // sent to the model nor actionable. On the live mailbox that was 52 emails and the
+        // reason the app could clean nothing.
+        let email = makeEmail(
+            senderEmail: "hello@unrecognised.example",
+            subject: "Bekijk onze nieuwe collectie",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(
+            results[0].safetyTier, .safe,
+            "two independent classifiers agreeing is the evidence, not a relabelling"
+        )
+        XCTAssertEqual(results[0].evidence, .strong)
+    }
+
+    func testCorroborationStillCannotOverrideATransactionalFinding() async throws {
+        // The lift must not become a general-purpose escalation: it applies only where the
+        // rules independently concluded the mail was disposable.
+        let email = makeEmail(
+            senderEmail: "noreply@chase.com",
+            subject: "Your statement is ready",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    func testVetoAppliesToAnyAutoActionableCategoryNotJustPromotions() async throws {
+        // Regression from the live mailbox: a `social` domain match reached the actionable
+        // tier without consulting the provider, because the veto keyed on a category list
+        // that did not include social. Found as a YouTube Terms of Service notice Gmail had
+        // filed under Updates.
+        let email = makeEmail(
+            senderEmail: "no-reply@youtube.com",
+            subject: "Annual reminder about YouTube's Terms of Service",
+            labels: ["INBOX", "CATEGORY_UPDATES"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertTrue(results[0].reason.contains("Updates"))
+    }
+
+    func testSecurityAlertFromASocialPlatformIsNotAutoActionable() async throws {
+        // The case the veto actually exists for, and the reason the YouTube finding mattered
+        // despite being harmless itself: the same code path carries account-security mail.
+        let email = makeEmail(
+            senderEmail: "security@facebookmail.com",
+            subject: "New login to your account from an unrecognised device",
+            labels: ["INBOX", "CATEGORY_UPDATES"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    func testSocialMailTheProviderAlsoCallsSocialStaysActionable() async throws {
+        // The veto must not swallow the ordinary case it was never about.
+        let email = makeEmail(
+            senderEmail: "no-reply@youtube.com",
+            subject: "Someone commented on your video",
+            labels: ["INBOX", "CATEGORY_SOCIAL"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+    }
+
+    func testMailWithNoProviderLabelIsUnaffected() async throws {
+        let email = makeEmail(
+            senderEmail: "x@deals.someshop.com",
+            subject: "Weekend sale",
+            labels: ["INBOX", "UNREAD"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].category, .promotion)
+        XCTAssertFalse(results[0].reason.contains("Gmail"))
     }
 }

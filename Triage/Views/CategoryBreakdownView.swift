@@ -232,6 +232,9 @@ struct ConfidenceBadge: View {
 // MARK: - Email List View
 
 struct EmailListView: View {
+    /// The email whose categorization the user is fixing, if any.
+    @State private var correctingEmail: EmailMetadata?
+
     @EnvironmentObject private var appState: AppState
     let category: EmailCategory
 
@@ -273,6 +276,11 @@ struct EmailListView: View {
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
                         }
+                        // Right-click too: a table row is where a macOS user reaches for a
+                        // context menu first.
+                        .contextMenu {
+                            Button("Correct this categorization…") { correctingEmail = email }
+                        }
                     }
                     .width(min: 150, ideal: 200)
 
@@ -281,6 +289,17 @@ struct EmailListView: View {
                             .lineLimit(1)
                     }
                     .width(min: 200, ideal: 300)
+
+                    TableColumn("") { email in
+                        Button {
+                            correctingEmail = email
+                        } label: {
+                            Image(systemName: "pencil.line")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Correct this categorization")
+                    }
+                    .width(28)
 
                     TableColumn("Date") { email in
                         Text(email.date, style: .date)
@@ -322,6 +341,10 @@ struct EmailListView: View {
             SimilarEmailsView(sourceEmail: email)
                 .environmentObject(appState)
         }
+        .sheet(item: $correctingEmail) { email in
+            CorrectionSheet(email: email)
+                .environmentObject(appState)
+        }
     }
 
     private func loadEmails() async {
@@ -339,6 +362,9 @@ struct EmailListView: View {
 // MARK: - Tier Email List View
 
 struct TierEmailListView: View {
+    /// The email whose categorization the user is fixing, if any.
+    @State private var correctingEmail: EmailMetadata?
+
     @EnvironmentObject private var appState: AppState
     let tier: SafetyTier
 
@@ -379,6 +405,9 @@ struct TierEmailListView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
+                        .contextMenu {
+                            Button("Correct this categorization…") { correctingEmail = email }
+                        }
                     }
                     .width(min: 150, ideal: 200)
 
@@ -387,6 +416,17 @@ struct TierEmailListView: View {
                             .lineLimit(1)
                     }
                     .width(min: 200, ideal: 300)
+
+                    TableColumn("") { email in
+                        Button {
+                            correctingEmail = email
+                        } label: {
+                            Image(systemName: "pencil.line")
+                        }
+                        .buttonStyle(.borderless)
+                        .help("Correct this categorization")
+                    }
+                    .width(28)
 
                     TableColumn("Category") { email in
                         if let category = email.category {
@@ -419,6 +459,10 @@ struct TierEmailListView: View {
         }
         .task(id: tier) {
             await loadEmails()
+        }
+        .sheet(item: $correctingEmail) { email in
+            CorrectionSheet(email: email)
+                .environmentObject(appState)
         }
     }
 
