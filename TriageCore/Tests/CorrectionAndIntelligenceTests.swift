@@ -265,6 +265,62 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         XCTAssertEqual(merged.safetyTier, .review)
     }
 
+    func testAbstentionCannotRaiseSafetyOverTwoAgreeingClassifiers() {
+        // Regression from the live mailbox. NS is a mixed sender, so the model returned
+        // subject splits; this message matched neither, and the resulting "keep" verdict
+        // raised safety over mail the rules AND Gmail had both called marketing. 48 emails
+        // were held out of the actionable tier by it. An unmatched split is a gap in the
+        // model's pattern list, not evidence about the message.
+        let corroborated = CategorizationResult(
+            messageId: "m", category: .newsletter, safetyTier: .safe,
+            confidence: 0.9,
+            reason: "Bulk mail (List-Unsubscribe) — and Gmail also filed it under Promotions",
+            evidence: .strong
+        )
+        let mixedSenderVerdict = SenderVerdict(
+            senderEmail: "info@email.ns.nl",
+            category: .promotion,
+            mustKeep: false,
+            isRealPerson: false,
+            confidence: 0.75,
+            reason: "Mixed sender",
+            disposableSubjects: ["korting"],
+            keepSubjects: ["factuur"]
+        ).resolved(forSubject: "Beleef een betoverende kerstvakantie met NS Dagje Uit")
+
+        XCTAssertTrue(mixedSenderVerdict.isUnsure, "an unmatched split is an abstention")
+
+        let merged = AICategorizationEngine.merge(
+            rule: corroborated,
+            verdict: mixedSenderVerdict,
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(
+            merged.safetyTier, .safe,
+            "an abstention must not outrank two independent classifiers that agree"
+        )
+    }
+
+    func testAbstentionLeavesUncertainMailInReview() {
+        // The other side: where the rules were also unsure, an abstention changes nothing,
+        // which is the same outcome as before by a more honest route.
+        let weak = CategorizationResult(
+            messageId: "m", category: .unknown, safetyTier: .review,
+            confidence: 0.4, reason: "No matching rule"
+        )
+        let merged = AICategorizationEngine.merge(
+            rule: weak,
+            verdict: SenderVerdict(
+                senderEmail: "x@unknown.example", category: .promotion, mustKeep: false,
+                isRealPerson: false, confidence: 0.9, reason: "unsure", isUnsure: true
+            ),
+            providerCategory: .promotions
+        )
+
+        XCTAssertEqual(merged.safetyTier, .review)
+    }
+
     func testParsingReadsAbstentionAndSplits() {
         let payload = JSONValue.object([
             "verdicts": .array([

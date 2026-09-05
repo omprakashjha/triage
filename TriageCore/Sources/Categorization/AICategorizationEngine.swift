@@ -268,6 +268,26 @@ public final class AICategorizationEngine: CategorizationEngine {
         // A contact outranks any verdict, and nothing here may weaken that.
         guard rule.safetyTier != .protected_ else { return rule }
 
+        // An abstention is an ABSENCE of a verdict, not a verdict, so it may not move the
+        // tier in either direction — it has nothing to move it with. Letting it do so was a
+        // real regression: the model's "this sender is mixed and this subject matched
+        // neither of my patterns" was raising safety over mail that BOTH the rules and the
+        // provider had independently called marketing, which held 48 emails out of the
+        // actionable tier and left the app unable to clean anything.
+        //
+        // Mail the rules were also unsure about is unaffected: its tier is already review,
+        // so leaving it untouched is the same outcome by a more honest route.
+        if verdict.isUnsure {
+            return CategorizationResult(
+                messageId: rule.messageId,
+                category: rule.category,
+                safetyTier: rule.safetyTier,
+                confidence: rule.confidence,
+                reason: rule.reason + " — the model had no read on this message",
+                evidence: rule.evidence
+            )
+        }
+
         let ruleRank = strictness(rule.safetyTier)
         let verdictRank = strictness(verdict.impliedTier)
 

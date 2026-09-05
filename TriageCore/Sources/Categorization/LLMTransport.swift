@@ -186,7 +186,11 @@ public struct SenderVerdict: Sendable, Codable, Equatable {
         }
 
         // No split matched. If the model gave a split at all it was describing a mixed
-        // sender, so an unmatched message is one it did not account for — keep it.
+        // sender, so an unmatched message is one it did not account for — which is an
+        // ABSENCE of a verdict for this message, not a verdict to keep it. Marked unsure so
+        // the merge treats it as carrying no information: asserting `mustKeep` alone let a
+        // gap in the model's pattern list outrank two independent classifiers that had both
+        // called the message marketing (48 emails on the live mailbox).
         if !disposableSubjects.isEmpty || !keepSubjects.isEmpty {
             return SenderVerdict(
                 senderEmail: senderEmail,
@@ -197,7 +201,7 @@ public struct SenderVerdict: Sendable, Codable, Equatable {
                 reason: reason + " — mixed sender, this message matched neither pattern",
                 disposableSubjects: disposableSubjects,
                 keepSubjects: keepSubjects,
-                isUnsure: isUnsure
+                isUnsure: true
             )
         }
 
