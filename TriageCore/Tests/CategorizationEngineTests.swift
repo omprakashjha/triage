@@ -491,6 +491,39 @@ final class ProviderCategorySignalTests: XCTestCase {
         XCTAssertEqual(results[0].safetyTier, .protected_)
     }
 
+    func testCorroborationLiftsAProvisionalReviewToActionable() async throws {
+        // Regression. Corroboration used to PRESERVE the rules' tier, which was `.review`
+        // only because their own evidence was weak — so agreed-upon marketing was neither
+        // sent to the model nor actionable. On the live mailbox that was 52 emails and the
+        // reason the app could clean nothing.
+        let email = makeEmail(
+            senderEmail: "hello@unrecognised.example",
+            subject: "Bekijk onze nieuwe collectie",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"],
+            hasListUnsubscribe: true
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(
+            results[0].safetyTier, .safe,
+            "two independent classifiers agreeing is the evidence, not a relabelling"
+        )
+        XCTAssertEqual(results[0].evidence, .strong)
+    }
+
+    func testCorroborationStillCannotOverrideATransactionalFinding() async throws {
+        // The lift must not become a general-purpose escalation: it applies only where the
+        // rules independently concluded the mail was disposable.
+        let email = makeEmail(
+            senderEmail: "noreply@chase.com",
+            subject: "Your statement is ready",
+            labels: ["INBOX", "CATEGORY_PROMOTIONS"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
     func testMailWithNoProviderLabelIsUnaffected() async throws {
         let email = makeEmail(
             senderEmail: "x@deals.someshop.com",

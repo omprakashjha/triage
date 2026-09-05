@@ -171,11 +171,21 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         }
 
         // Independent agreement: two classifiers, one of them multilingual, same answer.
+        //
+        // This SETS the tier rather than preserving it. Preserving it was a real bug: the
+        // rules' tier is often `.review` only because their own evidence was weak, so
+        // inheriting it left corroborated mail in the worst possible place — no longer
+        // eligible for the model (it now counts as strong evidence) yet still not
+        // actionable. Measured on the live mailbox: 52 emails both classifiers agreed were
+        // marketing, all stuck in review, which is why the app could clean nothing.
+        //
+        // Two independent classifiers agreeing IS the evidence. Treating it as merely a
+        // relabelling wastes the only signal strong enough to act on without a model call.
         if weThinkDisposable && provider.isBulkMarketing {
             return CategorizationResult(
                 messageId: result.messageId,
                 category: result.category,
-                safetyTier: result.safetyTier,
+                safetyTier: .safe,
                 confidence: max(result.confidence, 0.9),
                 reason: result.reason + " — and Gmail also filed it under Promotions",
                 evidence: .strong
@@ -186,7 +196,7 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
             return CategorizationResult(
                 messageId: result.messageId,
                 category: .social,
-                safetyTier: result.safetyTier,
+                safetyTier: .safe,
                 confidence: max(result.confidence, 0.9),
                 reason: result.reason + " — and Gmail also filed it under Social",
                 evidence: .strong
