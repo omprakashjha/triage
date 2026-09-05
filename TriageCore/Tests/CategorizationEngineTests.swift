@@ -524,6 +524,47 @@ final class ProviderCategorySignalTests: XCTestCase {
         XCTAssertNotEqual(results[0].safetyTier, .safe)
     }
 
+    func testVetoAppliesToAnyAutoActionableCategoryNotJustPromotions() async throws {
+        // Regression from the live mailbox: a `social` domain match reached the actionable
+        // tier without consulting the provider, because the veto keyed on a category list
+        // that did not include social. Found as a YouTube Terms of Service notice Gmail had
+        // filed under Updates.
+        let email = makeEmail(
+            senderEmail: "no-reply@youtube.com",
+            subject: "Annual reminder about YouTube's Terms of Service",
+            labels: ["INBOX", "CATEGORY_UPDATES"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .review)
+        XCTAssertTrue(results[0].reason.contains("Updates"))
+    }
+
+    func testSecurityAlertFromASocialPlatformIsNotAutoActionable() async throws {
+        // The case the veto actually exists for, and the reason the YouTube finding mattered
+        // despite being harmless itself: the same code path carries account-security mail.
+        let email = makeEmail(
+            senderEmail: "security@facebookmail.com",
+            subject: "New login to your account from an unrecognised device",
+            labels: ["INBOX", "CATEGORY_UPDATES"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertNotEqual(results[0].safetyTier, .safe)
+    }
+
+    func testSocialMailTheProviderAlsoCallsSocialStaysActionable() async throws {
+        // The veto must not swallow the ordinary case it was never about.
+        let email = makeEmail(
+            senderEmail: "no-reply@youtube.com",
+            subject: "Someone commented on your video",
+            labels: ["INBOX", "CATEGORY_SOCIAL"]
+        )
+        let results = try await engine.categorize(emails: [email])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+    }
+
     func testMailWithNoProviderLabelIsUnaffected() async throws {
         let email = makeEmail(
             senderEmail: "x@deals.someshop.com",

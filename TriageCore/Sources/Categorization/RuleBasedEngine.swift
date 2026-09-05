@@ -157,7 +157,18 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         let weThinkDisposable = result.category == .promotion || result.category == .newsletter
 
         // Contradiction on disposability: trust the provider, and say so.
-        if weThinkDisposable && provider.arguesForKeeping {
+        //
+        // Keyed on the OUTCOME rather than a list of categories, because the list let cases
+        // through. A `social` match reached the auto-actionable tier without ever consulting
+        // the provider — found on the live mailbox as a YouTube Terms of Service notice that
+        // Gmail had filed under Updates. Harmless in itself, but the same path carries
+        // account-security alerts from social platforms, which are exactly the mail this
+        // veto exists to protect.
+        //
+        // The invariant is now simply: nothing the provider calls an Update or Personal is
+        // auto-actionable unless the user said so. User corrections are unaffected, since
+        // they are applied by a wrapper outside this engine.
+        if result.safetyTier == .safe && provider.arguesForKeeping {
             return CategorizationResult(
                 messageId: result.messageId,
                 category: result.category,
