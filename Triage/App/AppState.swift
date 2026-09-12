@@ -732,7 +732,7 @@ final class AppState: ObservableObject {
             let written = try await database.promoteCorrectionsToGoldenLabels(accountId: accountId)
             await loadGoldenLabels(accountId: accountId)
             correctionStatus = written == 0
-                ? "No sender-wide corrections to add. Subject-scoped ones can't become labels, since the evaluation set is keyed by sender."
+                ? "No corrections to add yet."
                 : "Added \(written) correction\(written == 1 ? "" : "s") to the evaluation set."
         } catch {
             correctionStatus = "Could not update the evaluation set: \(error.localizedDescription)"

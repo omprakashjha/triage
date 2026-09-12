@@ -393,6 +393,69 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         )
     }
 
+    // MARK: - Subject-scoped golden labels
+
+    func testEvaluatorScoresAgainstTheNarrowestMatchingLabel() {
+        // A sender with two scopes: its receipts must be kept, its marketing may go. Scoring
+        // both halves against one sender-wide label would mark correct behaviour wrong, which
+        // is why labels needed the same scope corrections already had.
+        let labels = [
+            GoldenLabel(
+                accountId: 1, senderEmail: "info@email.ns.nl",
+                expectedCategory: .promotion, disposition: .disposable
+            ),
+            GoldenLabel(
+                accountId: 1, senderEmail: "info@email.ns.nl", subjectPattern: "factuur",
+                expectedCategory: .transactional, disposition: .mustKeep
+            ),
+        ]
+
+        let receipt = email("a", sender: "info@email.ns.nl", subject: "Uw factuur van maart")
+        let promo = email("b", sender: "info@email.ns.nl", subject: "Korting op reizen")
+
+        let results = [
+            CategorizationResult(
+                messageId: "a", category: .transactional, safetyTier: .review,
+                confidence: 0.9, reason: "kept", evidence: .strong
+            ),
+            CategorizationResult(
+                messageId: "b", category: .promotion, safetyTier: .safe,
+                confidence: 0.9, reason: "marketing", evidence: .strong
+            ),
+        ]
+
+        let report = CategorizationEvaluator().evaluate(
+            emails: [receipt, promo], results: results, labels: labels, accountId: 1
+        )
+
+        XCTAssertEqual(report.evaluatedEmails, 2, "both halves are scoreable")
+        XCTAssertEqual(
+            report.categoryAccuracy, 1.0,
+            "each message scored against its own scope, so both are correct"
+        )
+    }
+
+    func testWholeSenderLabelStillCoversUnscopedMail() {
+        let labels = [
+            GoldenLabel(
+                accountId: 1, senderEmail: "x@shop.example",
+                expectedCategory: .promotion, disposition: .disposable
+            )
+        ]
+        let mail = email("a", sender: "x@shop.example", subject: "Anything at all")
+        let results = [
+            CategorizationResult(
+                messageId: "a", category: .promotion, safetyTier: .safe,
+                confidence: 0.9, reason: "r", evidence: .strong
+            )
+        ]
+
+        let report = CategorizationEvaluator().evaluate(
+            emails: [mail], results: results, labels: labels, accountId: 1
+        )
+        XCTAssertEqual(report.evaluatedEmails, 1)
+    }
+
     func testParsingReadsAbstentionAndSplits() {
         let payload = JSONValue.object([
             "verdicts": .array([

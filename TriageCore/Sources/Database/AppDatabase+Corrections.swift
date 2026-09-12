@@ -70,19 +70,23 @@ public extension AppDatabase {
     /// Turn corrections into golden labels, so accuracy becomes measurable from ordinary
     /// use instead of requiring a separate labelling chore.
     ///
-    /// Only whole-sender corrections become labels: the golden set is keyed by sender, so a
-    /// subject-scoped correction has no faithful representation in it and a partial one
-    /// would quietly poison the metric it exists to produce.
+    /// Promotes EVERY correction, subject scope included. This originally promoted only
+    /// whole-sender corrections, on the reasoning that the golden set was keyed by sender and
+    /// a partial representation would poison the metric. The reasoning was sound and the
+    /// conclusion was wrong: on real use 26 of 29 corrections were subject-scoped, so the
+    /// rule discarded 90% of the available ground truth and produced 3 labels — from which no
+    /// precision figure means anything. The right fix was to give labels the same scope
+    /// corrections have, not to throw the corrections away.
     func promoteCorrectionsToGoldenLabels(accountId: Int64) async throws -> Int {
         let all = try await corrections(accountId: accountId)
-        let senderWide = all.filter { $0.subjectPattern == nil }
 
         var written = 0
-        for correction in senderWide {
+        for correction in all {
             try await saveGoldenLabel(
                 GoldenLabel(
                     accountId: accountId,
                     senderEmail: correction.senderEmail,
+                    subjectPattern: correction.subjectPattern,
                     expectedCategory: correction.category,
                     disposition: correction.mustKeep ? .mustKeep : .disposable,
                     note: "From a user correction"

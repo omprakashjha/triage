@@ -14,6 +14,20 @@ public struct GoldenLabel: Identifiable, Codable, FetchableRecord, PersistableRe
     public var id: Int64?
     public var accountId: Int64
     public var senderEmail: String
+
+    /// When set, this label applies only to that sender's mail whose subject contains this
+    /// text, case-insensitively.
+    ///
+    /// Added because sender-level labelling could not represent what the user actually
+    /// produced. Of 29 real corrections, 26 were subject-scoped — the user was splitting
+    /// mixed senders, which is exactly the hard case worth measuring — so promoting only
+    /// whole-sender corrections yielded 3 labels and a precision figure computed from 3
+    /// labels is not a measurement.
+    ///
+    /// The original comment here claimed sender-level was sufficient because "the top ~100
+    /// senders cover most of a large mailbox". True of VOLUME, wrong about DIFFICULTY: the
+    /// senders that need measuring are precisely the ones a single label cannot describe.
+    public var subjectPattern: String?
     /// What this sender's mail actually is.
     public var expectedCategory: EmailCategory
     /// The judgement that actually matters for safety.
@@ -25,6 +39,7 @@ public struct GoldenLabel: Identifiable, Codable, FetchableRecord, PersistableRe
         id: Int64? = nil,
         accountId: Int64,
         senderEmail: String,
+        subjectPattern: String? = nil,
         expectedCategory: EmailCategory,
         disposition: Disposition,
         note: String? = nil,
@@ -33,10 +48,26 @@ public struct GoldenLabel: Identifiable, Codable, FetchableRecord, PersistableRe
         self.id = id
         self.accountId = accountId
         self.senderEmail = senderEmail.lowercased()
+        // Empty is treated as absent, so a blank field cannot create a label that matches
+        // every subject via the empty string.
+        let trimmed = subjectPattern?.trimmingCharacters(in: .whitespacesAndNewlines)
+        self.subjectPattern = (trimmed?.isEmpty ?? true) ? nil : trimmed?.lowercased()
         self.expectedCategory = expectedCategory
         self.disposition = disposition
         self.note = note
         self.labelledAt = labelledAt
+    }
+
+    /// Whether this label governs a given message.
+    public func matches(senderEmail: String, subject: String) -> Bool {
+        guard self.senderEmail == senderEmail.lowercased() else { return false }
+        guard let subjectPattern else { return true }
+        return subject.lowercased().contains(subjectPattern)
+    }
+
+    /// How specific this label is, so the narrowest matching one is scored against.
+    public var specificity: Int {
+        subjectPattern == nil ? 0 : 1
     }
 
     public enum Columns: String, ColumnExpression {
