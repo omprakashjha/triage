@@ -46,7 +46,11 @@ struct ReviewInboxView: View {
                 footer
             }
         }
-        .task(id: accountId) { await reload() }
+        // Keyed on the account list as well as the target id. Keying on the id alone was
+        // fragile: the id is derived from `appState.accounts`, which is loaded asynchronously
+        // by a parent view, so this screen can appear while it is still empty — and if the id
+        // is nil at that moment the load returns early and nothing re-triggers it.
+        .task(id: "\(appState.accounts.count)-\(accountId ?? -1)") { await reload() }
     }
 
     private var header: some View {
@@ -82,8 +86,29 @@ struct ReviewInboxView: View {
                     .foregroundStyle(.secondary)
                     .textSelection(.enabled)
             }
+
+            // Self-reporting state. This screen has now shown nothing twice while the database
+            // held matching rows, and both explanations were guesses that cost a round trip.
+            // An account-scoped screen that cannot say which account it queried, or whether the
+            // query ran at all, is unfixable from a bug report — so it says.
+            Text(diagnostic)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
+                .textSelection(.enabled)
         }
         .padding(20)
+    }
+
+    private var diagnostic: String {
+        let target = appState.settingsTarget
+            .map { "\($0.email) (id \($0.id.map(String.init) ?? "nil"))" } ?? "none"
+        let counts = appState.categorizedCountsByAccount
+            .map { "\($0.key):\($0.value)" }
+            .sorted()
+            .joined(separator: " ")
+        return "accounts loaded: \(appState.accounts.count) · target: \(target)"
+            + " · categorized per account: [\(counts.isEmpty ? "not loaded" : counts)]"
+            + " · queue: \(emails.count) · loading: \(isLoading)"
     }
 
     private var empty: some View {
