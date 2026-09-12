@@ -54,6 +54,17 @@ struct ReviewInboxView: View {
             HStack {
                 Text("Review")
                     .font(.title2.weight(.semibold))
+                // Named explicitly. These screens are account-scoped and used to say nothing
+                // about which account, so an empty screen was indistinguishable from a broken
+                // one — which is exactly how this screen was first reported.
+                if let account = appState.settingsTarget {
+                    Text(account.email)
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 if !emails.isEmpty {
                     Text("\(emails.count) awaiting your decision")
@@ -82,9 +93,22 @@ struct ReviewInboxView: View {
                 .foregroundStyle(.green)
             Text("Nothing awaiting review")
                 .font(.headline)
-            Text("Every email has been decided — by you, by a rule, or by the model.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+
+            // An empty state has to distinguish "finished" from "this account has no scanned
+            // mail", because those look identical and mean opposite things.
+            if let account = appState.settingsTarget,
+               let id = account.id,
+               (appState.categorizedCountsByAccount[id] ?? 0) == 0 {
+                Text("\(account.email) has no categorized mail yet — scan it, or pick another account in the sidebar.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            } else {
+                Text("Every email has been decided — by you, by a rule, or by the model.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }

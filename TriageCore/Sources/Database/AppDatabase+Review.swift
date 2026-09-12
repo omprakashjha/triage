@@ -4,6 +4,30 @@ import GRDB
 // MARK: - Reviewing individual messages
 
 public extension AppDatabase {
+    /// Categorized mail per account, so a default account can be chosen by which one has data.
+    ///
+    /// Exists because "the first account by id" was the wrong default and failed silently: on a
+    /// two-account setup the first held 11,600 emails with none categorized, so every
+    /// account-scoped screen defaulted to it and rendered empty.
+    func categorizedCountsByAccount() async throws -> [Int64: Int] {
+        try await dbWriter.read { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT accountId, COUNT(*) AS n FROM emailMetadata
+                    WHERE category IS NOT NULL
+                    GROUP BY accountId
+                    """
+            )
+            var counts: [Int64: Int] = [:]
+            for row in rows {
+                let id: Int64 = row["accountId"]
+                counts[id] = row["n"] ?? 0
+            }
+            return counts
+        }
+    }
+
     /// Mail still awaiting a decision, newest first, with the model's reasoning attached.
     func emailsAwaitingReview(accountId: Int64, limit: Int = 500) async throws -> [EmailMetadata] {
         try await dbWriter.read { db in

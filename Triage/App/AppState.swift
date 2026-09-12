@@ -91,11 +91,28 @@ final class AppState: ObservableObject {
     /// Falls back to the first account when the sidebar has no selection, so the toolbar
     /// action is never dead just because a selection was lost — which is exactly how the
     /// old in-view Scan button became unreachable.
-    var scanTarget: EmailAccount? {
-        selectedAccount ?? accounts.first
+    /// How much categorized mail each account holds, so a fallback can pick a useful one.
+    @Published var categorizedCountsByAccount: [Int64: Int] = [:]
+
+    /// The account with the most categorized mail — the one actually being worked on.
+    ///
+    /// `accounts.first` was the wrong fallback and produced a silent failure. Ordered by id,
+    /// the first account here is one with 11,600 emails and none categorized, so every
+    /// account-scoped screen defaulted to showing nothing and looked broken. "First by id" is
+    /// arbitrary; "the one with data in it" is what the user meant.
+    var primaryAccount: EmailAccount? {
+        accounts.max { lhs, rhs in
+            let l = lhs.id.flatMap { categorizedCountsByAccount[$0] } ?? 0
+            let r = rhs.id.flatMap { categorizedCountsByAccount[$0] } ?? 0
+            return l < r
+        }
     }
 
-    /// Which account the Settings screen reads and writes.
+    var scanTarget: EmailAccount? {
+        selectedAccount ?? primaryAccount ?? accounts.first
+    }
+
+    /// Which account the account-scoped screens read and write.
     ///
     /// Same fallback, for the same reason. Settings gated its whole data load on an explicit
     /// sidebar selection, so with none it loaded nothing at all — the corrections list read
@@ -104,7 +121,7 @@ final class AppState: ObservableObject {
     /// navigated to deliberately should act on the obvious account rather than wait to be
     /// told which one.
     var settingsTarget: EmailAccount? {
-        selectedAccount ?? accounts.first
+        selectedAccount ?? primaryAccount ?? accounts.first
     }
 
     /// Scan whichever account is targeted, selecting it first so the UI agrees with what
@@ -120,6 +137,10 @@ final class AppState: ObservableObject {
     func loadAccounts() async {
         do {
             accounts = try await database.fetchAllAccounts()
+            // Loaded here so the fallback account can be chosen by which one has data, rather
+            // than by id order — which silently pointed every account-scoped screen at an
+            // account holding 11,600 uncategorized emails and nothing to show.
+            categorizedCountsByAccount = try await database.categorizedCountsByAccount()
         } catch {
             print("Failed to load accounts: \(error)")
         }

@@ -69,6 +69,16 @@ struct DecisionQueueView: View {
             HStack {
                 Text("Decide")
                     .font(.title2.weight(.semibold))
+                // Same reason as the Review screen: account-scoped without saying so meant an
+                // empty screen read as a bug.
+                if let account = appState.settingsTarget {
+                    Text(account.email)
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.secondary.opacity(0.12), in: Capsule())
+                        .foregroundStyle(.secondary)
+                }
                 Spacer()
                 // The agreement rate IS the accuracy figure — confirmations are judgements the
                 // user made against verdicts the model reached independently.
