@@ -52,7 +52,8 @@ final class AICategorizationEngineTests: XCTestCase {
         category: EmailCategory = .promotion,
         mustKeep: Bool = false,
         isRealPerson: Bool = false,
-        confidence: Double = 0.9
+        confidence: Double = 0.9,
+        isUnsure: Bool = false
     ) -> SenderVerdict {
         SenderVerdict(
             senderEmail: sender,
@@ -60,7 +61,8 @@ final class AICategorizationEngineTests: XCTestCase {
             mustKeep: mustKeep,
             isRealPerson: isRealPerson,
             confidence: confidence,
-            reason: "mock reason"
+            reason: "mock reason",
+            isUnsure: isUnsure
         )
     }
 
@@ -167,7 +169,10 @@ final class AICategorizationEngineTests: XCTestCase {
             verdict: verdict("x@shop.com", category: .transactional, mustKeep: true)
         )
 
-        XCTAssertEqual(merged.safetyTier, .review, "the model may always argue for keeping")
+        XCTAssertEqual(
+            merged.safetyTier, .protected_,
+            "the model may always argue for keeping, and that argument is a decision"
+        )
     }
 
     func testVerdictNeverWeakensAProtectedContact() {
@@ -209,7 +214,9 @@ final class AICategorizationEngineTests: XCTestCase {
             verdict: verdict("orders@shop.com", category: .transactional, mustKeep: true)
         )
 
-        XCTAssertEqual(merged.safetyTier, .review)
+        // protected_, not review: a model decision to KEEP is a decision, and filing it
+        // under "needs review" is what made 131 decided emails look like pending work.
+        XCTAssertEqual(merged.safetyTier, .protected_)
         XCTAssertEqual(merged.category, .transactional)
     }
 
@@ -226,12 +233,17 @@ final class AICategorizationEngineTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.category, .social, "a STRONG rule result keeps its category")
-        XCTAssertEqual(merged.safetyTier, .review, "but the model can still raise safety")
+        XCTAssertEqual(
+            merged.safetyTier, .protected_,
+            "the model can still raise safety, and a keep decision is settled not pending"
+        )
     }
 
     func testImpliedTierOrdering() {
         XCTAssertEqual(verdict("a", isRealPerson: true).impliedTier, .protected_)
-        XCTAssertEqual(verdict("a", mustKeep: true).impliedTier, .review)
+        // review is now reserved for the ABSENCE of a decision, which is abstention only.
+        XCTAssertEqual(verdict("a", mustKeep: true).impliedTier, .protected_)
+        XCTAssertEqual(verdict("a", isUnsure: true).impliedTier, .review)
         XCTAssertEqual(verdict("a").impliedTier, .safe)
     }
 
@@ -498,7 +510,7 @@ final class AICategorizationEngineTests: XCTestCase {
         XCTAssertEqual(verdicts[0].category, .unknown)
         XCTAssertTrue(verdicts[0].mustKeep, "an unrecognised category must not be treated as disposable")
         XCTAssertLessThanOrEqual(verdicts[0].confidence, 0.3)
-        XCTAssertEqual(verdicts[0].impliedTier, .review)
+        XCTAssertEqual(verdicts[0].impliedTier, .protected_)
     }
 
     func testMalformedEntriesAreSkippedNotDefaulted() {

@@ -140,11 +140,26 @@ public struct SenderVerdict: Sendable, Codable, Equatable {
 
     /// The tier this verdict implies on its own.
     ///
-    /// A real person, mail the model says must be kept, or an abstention is never
-    /// auto-actionable.
+    /// `mustKeep` yields `.protected_`, not `.review`. This looks like a small change and is
+    /// the difference between the app appearing to work and appearing to do nothing.
+    ///
+    /// Measured on a real mailbox: of 219 emails sitting in `review`, 131 were there because
+    /// the model had DECIDED to keep them. A decision to keep is a decision — filing it under
+    /// "needs review" presented finished work as an open question, so a user who had just
+    /// confirmed 28 senders saw no change at all and reasonably concluded the reviewing was
+    /// not happening. It was; the tier could not express it.
+    ///
+    /// `review` now means only what its name says: nobody has decided yet. That is the
+    /// abstention case and the genuinely-unexamined case, and nothing else.
+    ///
+    /// Note the direction: this moves mail AWAY from being actionable, so it cannot cause
+    /// data loss. It is the conservative reading as well as the honest one.
     public var impliedTier: SafetyTier {
         if isRealPerson { return .protected_ }
-        if isUnsure || mustKeep { return .review }
+        // An abstention is the absence of a decision, so it is the one case that genuinely
+        // belongs in review.
+        if isUnsure { return .review }
+        if mustKeep { return .protected_ }
         return .safe
     }
 

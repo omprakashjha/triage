@@ -181,7 +181,8 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         let receipt = verdict.resolved(forSubject: "Uw factuur van maart")
         XCTAssertTrue(receipt.mustKeep)
         XCTAssertEqual(receipt.category, .transactional, "a kept message is not promotional")
-        XCTAssertEqual(receipt.impliedTier, .review)
+        // Settled, not pending: the model read this message and decided to keep it.
+        XCTAssertEqual(receipt.impliedTier, .protected_)
     }
 
     func testUnmatchedMessageFromAMixedSenderIsKept() {
@@ -454,6 +455,50 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
             emails: [mail], results: results, labels: labels, accountId: 1
         )
         XCTAssertEqual(report.evaluatedEmails, 1)
+    }
+
+    func testReviewMeansUndecidedAndNothingElse() {
+        // The whole point of the tier fix. Measured on a real mailbox, 219 emails sat in
+        // review and 131 of them were there because the model had DECIDED to keep them —
+        // finished work presented as an open question, which is why confirming 28 senders
+        // produced no visible change and the user concluded the reviewing was not happening.
+        //
+        // review is now reserved for the absence of a decision.
+        let decidedKeep = SenderVerdict(
+            senderEmail: "bank@example.com", category: .transactional, mustKeep: true,
+            isRealPerson: false, confidence: 0.95, reason: "statements"
+        )
+        let decidedDispose = SenderVerdict(
+            senderEmail: "shop@example.com", category: .promotion, mustKeep: false,
+            isRealPerson: false, confidence: 0.9, reason: "marketing"
+        )
+        let undecided = SenderVerdict(
+            senderEmail: "who@example.com", category: .unknown, mustKeep: true,
+            isRealPerson: false, confidence: 0.3, reason: "cannot tell", isUnsure: true
+        )
+
+        XCTAssertEqual(decidedKeep.impliedTier, .protected_, "a keep decision is settled")
+        XCTAssertEqual(decidedDispose.impliedTier, .safe, "a dispose decision is settled")
+        XCTAssertEqual(undecided.impliedTier, .review, "only an abstention is pending")
+    }
+
+    func testTheTierFixCannotMakeMailMoreDeletable() {
+        // Guard on the direction of the change: every tier this moved went AWAY from
+        // actionable, so it cannot cause data loss. If a future edit inverts that, this fails.
+        for mustKeep in [true, false] {
+            for unsure in [true, false] {
+                let v = SenderVerdict(
+                    senderEmail: "x@example.com", category: .promotion, mustKeep: mustKeep,
+                    isRealPerson: false, confidence: 0.9, reason: "r", isUnsure: unsure
+                )
+                if mustKeep || unsure {
+                    XCTAssertNotEqual(
+                        v.impliedTier, .safe,
+                        "keep or unsure must never be auto-actionable"
+                    )
+                }
+            }
+        }
     }
 
     func testParsingReadsAbstentionAndSplits() {
