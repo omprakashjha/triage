@@ -37,8 +37,17 @@ struct DecisionQueueView: View {
             header
             Divider()
 
-            if appState.isLoadingCandidates {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Covers the whole window before a load COMPLETES for THIS account, not just the
+            // interval where a fetch is in flight — the screen appears while its parent is
+            // still loading accounts, and an empty list in that gap is not an empty list.
+            if appState.isLoadingCandidates || appState.loadedCandidatesAccountId != accountId {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Working out which decisions matter most…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if let candidate = current {
                 ScrollView {
                     card(for: candidate)

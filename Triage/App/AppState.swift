@@ -681,11 +681,26 @@ final class AppState: ObservableObject {
 
     @Published var reviewQueue: [EmailMetadata] = []
     @Published var isLoadingReviewQueue = false
+    /// Which account the current `reviewQueue` was loaded FOR.
+    ///
+    /// An id rather than a bool, because a bool would let one account's completed load vouch
+    /// for another's: switch accounts and the screen would present the previous account's
+    /// result as this one's finished answer. The id makes "loaded" a claim about a specific
+    /// account, which is the only form of it that is true.
+    ///
+    /// It exists at all because an empty `reviewQueue` is otherwise ambiguous — "nothing to
+    /// review" and "nothing fetched yet" look identical — and the screen resolved that by
+    /// asserting the first, displaying "Nothing awaiting review" while 103 emails were still
+    /// on their way.
+    @Published var loadedReviewQueueAccountId: Int64?
     @Published var reviewStatus: String?
 
     func loadReviewQueue(accountId: Int64) async {
         isLoadingReviewQueue = true
-        defer { isLoadingReviewQueue = false }
+        defer {
+            isLoadingReviewQueue = false
+            loadedReviewQueueAccountId = accountId
+        }
         do {
             reviewQueue = try await database.emailsAwaitingReview(accountId: accountId)
         } catch {
@@ -740,12 +755,19 @@ final class AppState: ObservableObject {
 
     @Published var triageCandidates: [TriageCandidate] = []
     @Published var isLoadingCandidates = false
+    /// Which account the candidate list was loaded for. Same reasoning as the review queue: an
+    /// empty list before a load has finished is not an empty list, and "Nothing left to decide"
+    /// is a claim this screen must not make until it has actually looked.
+    @Published var loadedCandidatesAccountId: Int64?
     @Published var agreement: (confirmed: Int, overturned: Int) = (0, 0)
 
     /// Load the senders worth asking about, highest leverage first.
     func loadTriageCandidates(accountId: Int64) async {
         isLoadingCandidates = true
-        defer { isLoadingCandidates = false }
+        defer {
+            isLoadingCandidates = false
+            loadedCandidatesAccountId = accountId
+        }
 
         // Keyed to the CURRENT model and prompt, so the queue shows the verdict the user
         // would actually be endorsing rather than one from a superseded configuration.

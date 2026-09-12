@@ -26,18 +26,58 @@ struct ReviewInboxView: View {
 
     private var accountId: Int64? { appState.settingsTarget?.id }
 
-    private var bySender: [(sender: String, emails: [EmailMetadata])] {
+    /// One sender's mail awaiting review.
+    ///
+    /// A named Identifiable type rather than the labelled tuple this started as. `ForEach` over
+    /// an array of tuples keyed by KeyPath compiles and is the least conventional construct in
+    /// this file, which made it the first thing to remove once the diagnostic proved the data
+    /// was present (queue: 103) and the rows still did not appear.
+    private struct SenderGroup: Identifiable {
+        let id: String
+        let emails: [EmailMetadata]
+        var sender: String { id }
+        var count: Int { emails.count }
+    }
+
+    private var bySender: [SenderGroup] {
         Dictionary(grouping: emails, by: \.senderEmail)
-            .map { (sender: $0.key, emails: $0.value.sorted { $0.date > $1.date }) }
-            .sorted { $0.emails.count > $1.emails.count }
+            .map { SenderGroup(id: $0.key, emails: $0.value.sorted { $0.date > $1.date }) }
+            .sorted { $0.count > $1.count }
+    }
+
+    private var list: some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 4) {
+                ForEach(bySender) { group in
+                    senderSection(group.sender, group.emails)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.horizontal, 20)
+            .padding(.vertical, 12)
+        }
+        // Explicit, so the scroll region cannot collapse to nothing inside the enclosing
+        // fixed-spacing VStack.
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if isLoading {
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            // Loading covers the whole window before a first load COMPLETES, not merely the
+            // interval where a fetch is in flight. Those differ: this screen appears while its
+            // parent is still loading the account list, so there is a real gap where nothing is
+            // fetching and nothing has been fetched — and showing the empty state there told the
+            // user "nothing awaiting review" about 103 emails that had not arrived yet.
+            if isLoading || appState.loadedReviewQueueAccountId != accountId {
+                VStack(spacing: 8) {
+                    ProgressView()
+                    Text("Loading mail awaiting review…")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else if emails.isEmpty {
                 empty
             } else {
@@ -138,17 +178,6 @@ struct ReviewInboxView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private var list: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
-                ForEach(bySender, id: \.sender) { group in
-                    senderSection(group.sender, group.emails)
-                }
-            }
-            .padding(.horizontal, 20)
-            .padding(.vertical, 12)
-        }
-    }
 
     private func senderSection(_ sender: String, _ mail: [EmailMetadata]) -> some View {
         VStack(alignment: .leading, spacing: 4) {
