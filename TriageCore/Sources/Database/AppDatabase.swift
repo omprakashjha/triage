@@ -38,11 +38,19 @@ public final class AppDatabase: Sendable {
 
     private static func makeConfiguration() -> Configuration {
         var config = Configuration()
-        #if DEBUG
-        config.prepareDatabase { db in
-            db.trace { print("SQL: \($0)") }
+        // Tracing is opt-in via TRIAGE_SQL_TRACE=1 rather than on in every DEBUG build.
+        //
+        // It was unconditional under #if DEBUG, which is a real hazard in a bundled GUI app:
+        // `print` goes to a stdout pipe that nothing drains when the app is launched by the
+        // Finder or `open`, and once that buffer fills the write BLOCKS — on the database
+        // queue, which serializes every read and write in the app. A categorization pass issues
+        // hundreds of statements, so the symptom is the whole UI stalling for seconds with a
+        // sidebar that renders empty, which looks like a data-loading bug and is not one.
+        if ProcessInfo.processInfo.environment["TRIAGE_SQL_TRACE"] == "1" {
+            config.prepareDatabase { db in
+                db.trace { print("SQL: \($0)") }
+            }
         }
-        #endif
         return config
     }
 

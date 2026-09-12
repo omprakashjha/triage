@@ -99,12 +99,37 @@ struct SidebarView: View {
     @State private var showDeleteConfirmation = false
 
     var body: some View {
-        List(selection: $appState.selectedAccount) {
+        // Deliberately NOT `List(selection: $appState.selectedAccount)`.
+        //
+        // The navigation rows below are Buttons that set `detailRoute`, and they sat inside a
+        // List whose selection was bound to `selectedAccount`. One tap therefore wrote two
+        // @Published properties — the route directly, and the account via the List's own
+        // selection machinery — and the view appearing as a result published further changes
+        // from its `.task` inside the same update cycle. That is the "publishing changes from
+        // within view updates" hazard, and on a macOS List it manifested as every row in the
+        // sidebar vanishing on the first click of a navigation item.
+        //
+        // Accounts are now selected by an explicit tap like the routes are, so there is exactly
+        // one mechanism writing this state and nothing SwiftUI reads and writes concurrently.
+        // The selected highlight is drawn the same way the route rows draw theirs.
+        List {
             Section("Accounts") {
                 ForEach(appState.accounts) { account in
-                    Label(account.email, systemImage: account.provider.iconName)
-                        .tag(account)
-                        .contextMenu {
+                    Button {
+                        appState.selectedAccount = account
+                    } label: {
+                        HStack {
+                            Label(account.email, systemImage: account.provider.iconName)
+                            Spacer()
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(
+                        appState.selectedAccount == account ? Color.accentColor : Color.primary
+                    )
+                    .fontWeight(appState.selectedAccount == account ? .semibold : .regular)
+                    .contextMenu {
                             Button {
                                 Task {
                                     appState.selectedAccount = account
