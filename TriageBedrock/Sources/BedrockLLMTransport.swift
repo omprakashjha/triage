@@ -87,30 +87,97 @@ public struct BedrockLLMTransport: LLMTransport {
         let payload: JSONValue
         do {
             payload = try await send(
-                client, senders: senders, corrections: corrections, includeTemperature: true
+                client,
+                systemPrompt: SenderClassificationPrompt.systemPrompt(corrections: corrections),
+                userMessage: SenderClassificationPrompt.userMessage(for: senders),
+                schema: SenderClassificationPrompt.outputSchema,
+                toolName: SenderClassificationPrompt.toolName,
+                toolDescription: SenderClassificationPrompt.toolDescription,
+                includeTemperature: true
             )
         } catch BedrockTransportError.temperatureRejected {
             // Some newer models reject `temperature` outright (Opus 5 among them).
             // Retry once without it rather than making the user discover this per model.
             payload = try await send(
-                client, senders: senders, corrections: corrections, includeTemperature: false
+                client,
+                systemPrompt: SenderClassificationPrompt.systemPrompt(corrections: corrections),
+                userMessage: SenderClassificationPrompt.userMessage(for: senders),
+                schema: SenderClassificationPrompt.outputSchema,
+                toolName: SenderClassificationPrompt.toolName,
+                toolDescription: SenderClassificationPrompt.toolDescription,
+                includeTemperature: false
             )
         }
 
         return SenderClassificationPrompt.parseVerdicts(from: payload)
     }
 
+    /// Classify individual messages the sender pass could not decide.
+    public func classify(
+        messages: [MessageClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [MessageVerdict] {
+        guard !messages.isEmpty else { return [] }
+
+        let client: BedrockRuntimeClient
+        do {
+            let config = try await BedrockRuntimeClient
+                .BedrockRuntimeClientConfiguration(region: region)
+            client = BedrockRuntimeClient(config: config)
+        } catch {
+            throw BedrockTransportError.credentialsUnavailable
+        }
+
+        let system = MessageClassificationPrompt.systemPrompt(corrections: corrections)
+        let body = MessageClassificationPrompt.userMessage(for: messages)
+
+        let payload: JSONValue
+        do {
+            payload = try await send(
+                client,
+                systemPrompt: system,
+                userMessage: body,
+                schema: MessageClassificationPrompt.outputSchema,
+                toolName: MessageClassificationPrompt.toolName,
+                toolDescription: MessageClassificationPrompt.toolDescription,
+                includeTemperature: true
+            )
+        } catch BedrockTransportError.temperatureRejected {
+            payload = try await send(
+                client,
+                systemPrompt: system,
+                userMessage: body,
+                schema: MessageClassificationPrompt.outputSchema,
+                toolName: MessageClassificationPrompt.toolName,
+                toolDescription: MessageClassificationPrompt.toolDescription,
+                includeTemperature: false
+            )
+        }
+
+        return MessageClassificationPrompt.parseVerdicts(from: payload)
+    }
+
+    /// One request shape for both passes.
+    ///
+    /// Generalised rather than copied: every Bedrock failure mode worth translating - access
+    /// denied, model not found, throttling, the temperature rejection newer models need, and
+    /// credential resolution that only surfaces on the CALL - is handled here. A second
+    /// prompt with its own copy of that would drift, and the drift would show up as an
+    /// unhelpful error at the worst moment.
     private func send(
         _ client: BedrockRuntimeClient,
-        senders: [SenderClassificationRequest],
-        corrections: [CorrectionExample],
+        systemPrompt: String,
+        userMessage: String,
+        schema: JSONValue,
+        toolName: String,
+        toolDescription: String,
         includeTemperature: Bool
     ) async throws -> JSONValue {
         let tool = BedrockRuntimeClientTypes.Tool.toolspec(
             BedrockRuntimeClientTypes.ToolSpecification(
-                description: SenderClassificationPrompt.toolDescription,
-                inputSchema: .json(SenderClassificationPrompt.outputSchema.smithyDocument),
-                name: SenderClassificationPrompt.toolName
+                description: toolDescription,
+                inputSchema: .json(schema.smithyDocument),
+                name: toolName
             )
         )
 
@@ -123,19 +190,17 @@ public struct BedrockLLMTransport: LLMTransport {
             ),
             messages: [
                 BedrockRuntimeClientTypes.Message(
-                    content: [.text(SenderClassificationPrompt.userMessage(for: senders))],
+                    content: [.text(userMessage)],
                     role: .user
                 )
             ],
             modelId: modelId,
-            system: [.text(SenderClassificationPrompt.systemPrompt(corrections: corrections))],
+            system: [.text(systemPrompt)],
             toolConfig: BedrockRuntimeClientTypes.ToolConfiguration(
                 // Forced: prose instead of a tool call would mean parsing free text into
                 // a decision that sets a safety tier.
                 toolChoice: .tool(
-                    BedrockRuntimeClientTypes.SpecificToolChoice(
-                        name: SenderClassificationPrompt.toolName
-                    )
+                    BedrockRuntimeClientTypes.SpecificToolChoice(name: toolName)
                 ),
                 tools: [tool]
             )
@@ -173,7 +238,7 @@ public struct BedrockLLMTransport: LLMTransport {
             throw BedrockTransportError.modelUnavailable(text)
         }
 
-        return try Self.toolInput(from: output, expecting: SenderClassificationPrompt.toolName)
+        return try Self.toolInput(from: output, expecting: toolName)
     }
 
     /// Pulls the forced tool call out of the response.

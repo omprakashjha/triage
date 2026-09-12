@@ -25,15 +25,25 @@ public struct AIRunDiagnostics: Sendable {
     public var batchesRequested = 0
     public var verdictsReturned = 0
     public var mergesApplied = 0
+    /// The second pass, reported separately so it is visible whether reading individual
+    /// messages actually resolved anything.
+    public var messageBatchesRequested = 0
+    public var messageVerdictsReturned = 0
+    public var messagesResolved = 0
     public var failure: String?
 
     public var summary: String {
         if let failure {
             return "AI pass FAILED after \(verdictsReturned) verdicts: \(failure)"
         }
-        return "AI: \(sendersConsidered) ambiguous senders, "
+        var text = "AI: \(sendersConsidered) ambiguous senders, "
             + "\(verdictsFromCache) cached + \(verdictsReturned) fetched in \(batchesRequested) call(s), "
             + "\(mergesApplied) emails merged."
+        if messageBatchesRequested > 0 {
+            text += " Then read \(messageVerdictsReturned) individual messages in "
+                + "\(messageBatchesRequested) call(s), resolving \(messagesResolved)."
+        }
+        return text
     }
 }
 
@@ -56,6 +66,14 @@ public final class AICategorizationEngine: CategorizationEngine {
     /// mailbox needed roughly 76 sender verdicts in total, so this is single-digit call
     /// counts either way, and they are cached per model and prompt version.
     public static let batchSize = 10
+
+    /// How many MESSAGES go into one call.
+    ///
+    /// Larger than the sender batch because a message request is much smaller — one subject,
+    /// one preview, no sample list — and the judgements are more independent of each other, so
+    /// dividing attention costs less here than it does when comparing a sender's subjects
+    /// against one another.
+    public static let messageBatchSize = 20
 
     private let rules: RuleBasedEngine
     private let transport: LLMTransport
@@ -104,6 +122,121 @@ public final class AICategorizationEngine: CategorizationEngine {
             onDiagnostics?(diagnostics)
             throw error
         }
+    }
+
+    /// Read and decide the messages the sender-level pass left undecided.
+    ///
+    /// "Undecided" means still in `review` — which, since a keep decision now lands in
+    /// `protected_`, is exactly the set nobody has ruled on. Mail the user corrected never
+    /// reaches here: those are settled by a wrapper outside this engine.
+    private func classifyUndecidedMessages(
+        emails: [EmailMetadata],
+        resultsById: inout [String: CategorizationResult],
+        diagnostics: inout AIRunDiagnostics
+    ) async throws {
+        let undecided = emails.filter { email in
+            guard let result = resultsById[email.messageId] else { return false }
+            return result.safetyTier == .review
+        }
+        guard !undecided.isEmpty else { return }
+
+        let learned = await correctionExamples()
+        let now = Date()
+
+        var requests: [MessageClassificationRequest] = []
+        var providerByMessageId: [String: ProviderCategory] = [:]
+        for email in undecided {
+            let ageDays = Int(now.timeIntervalSince(email.date) / 86400)
+            if let provider = email.providerCategory {
+                providerByMessageId[email.messageId] = provider
+            }
+            requests.append(
+                MessageClassificationRequest(
+                    messageId: email.messageId,
+                    senderEmail: email.senderEmail,
+                    displayName: email.sender,
+                    subject: email.subject,
+                    // Only when the user allowed body previews, on the same terms as the
+                    // sender pass — the closure is absent otherwise, so there is no path
+                    // that reads message content without consent.
+                    snippet: sampleSnippets == nil ? nil : email.snippet,
+                    ageDays: max(0, ageDays),
+                    providerCategory: email.providerCategory,
+                    senderVerdictSummary: resultsById[email.messageId]?.reason,
+                    hasUnsubscribe: email.hasListUnsubscribe
+                )
+            )
+        }
+
+        for batch in requests.chunked(into: Self.messageBatchSize) {
+            diagnostics.messageBatchesRequested += 1
+            let verdicts = try await transport.classify(messages: batch, corrections: learned)
+            diagnostics.messageVerdictsReturned += verdicts.count
+
+            for verdict in verdicts {
+                guard let rule = resultsById[verdict.messageId] else { continue }
+                resultsById[verdict.messageId] = Self.mergeMessage(
+                    rule: rule,
+                    verdict: verdict,
+                    // Must be passed, not defaulted. Omitting it left every disposable verdict
+                    // uncorroborated and therefore stuck in review, which would have made this
+                    // whole pass produce no visible movement — the exact complaint it exists
+                    // to answer.
+                    providerCategory: providerByMessageId[verdict.messageId]
+                )
+                diagnostics.messagesResolved += 1
+            }
+        }
+    }
+
+    /// Fold a message-level verdict into the result.
+    ///
+    /// The same asymmetry as everywhere else, for the same reason: the model may settle mail
+    /// as KEEP on its own, because that direction cannot lose anything. Moving mail toward
+    /// deletion still needs a second source — here the provider agreeing it is bulk
+    /// marketing — because one model call, however well informed, is a single fallible
+    /// source and a hallucinated "disposable" costs a real message.
+    ///
+    /// Reaching this point means the sender pass could not decide, so there is no earned
+    /// finding to protect and the verdict is free to resolve it in the keep direction.
+    static func mergeMessage(
+        rule: CategorizationResult,
+        verdict: MessageVerdict,
+        providerCategory: ProviderCategory? = nil
+    ) -> CategorizationResult {
+        guard rule.safetyTier != .protected_ else { return rule }
+
+        // An abstention at message level too: nothing read, nothing decided, stays pending.
+        if verdict.isUnsure {
+            return CategorizationResult(
+                messageId: rule.messageId,
+                category: rule.category,
+                safetyTier: .review,
+                confidence: rule.confidence,
+                reason: rule.reason + " — the model read this message and still could not tell",
+                evidence: .weak
+            )
+        }
+
+        let tier: SafetyTier
+        if verdict.mustKeep {
+            tier = .protected_
+        } else if providerCategory?.isBulkMarketing == true {
+            tier = .safe
+        } else {
+            // Decided disposable, uncorroborated: the category is recorded so the user can see
+            // the judgement, but it does not become auto-actionable on one source alone.
+            tier = .review
+        }
+
+        return CategorizationResult(
+            messageId: rule.messageId,
+            category: verdict.category,
+            safetyTier: tier,
+            confidence: verdict.confidence,
+            reason: "AI read this message: \(verdict.reason)",
+            evidence: .strong
+        )
     }
 
     private func runCategorize(
@@ -172,6 +305,24 @@ public final class AICategorizationEngine: CategorizationEngine {
             )
             diagnostics.mergesApplied += 1
         }
+
+        // SECOND PASS: read the messages the sender pass could not decide.
+        //
+        // Sender-level classification has a ceiling that a real mailbox walked into. A rail
+        // operator's subject patterns matched a handful of its 54 messages, because that
+        // sender writes fresh marketing copy every week — "Maak kans op een jaar gratis
+        // treinen!" is unmistakably promotional and matches no pattern anyone would have
+        // written in advance. No pattern set generalises over editorial variety; reading the
+        // message does.
+        //
+        // Scoped deliberately to the undecided residue. It is the only mail where this buys
+        // anything, and it keeps the call count proportional to what is actually unresolved
+        // rather than to mailbox size.
+        try await classifyUndecidedMessages(
+            emails: emails,
+            resultsById: &resultsById,
+            diagnostics: &diagnostics
+        )
 
         // Preserve input order.
         return emails.compactMap { resultsById[$0.messageId] }

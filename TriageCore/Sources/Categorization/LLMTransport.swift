@@ -246,12 +246,32 @@ public protocol LLMTransport: Sendable {
         senders: [SenderClassificationRequest],
         corrections: [CorrectionExample]
     ) async throws -> [SenderVerdict]
+
+    /// Classify individual messages the sender-level pass could not decide.
+    ///
+    /// A separate call rather than a mode flag, because it is a different question with a
+    /// different prompt and output shape. Optional with a default so a transport that cannot
+    /// do it degrades to leaving those messages undecided, which is the correct failure —
+    /// never to guessing at them.
+    func classify(
+        messages: [MessageClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [MessageVerdict]
 }
 
 public extension LLMTransport {
     /// Convenience for callers with nothing learned yet.
     func classify(senders: [SenderClassificationRequest]) async throws -> [SenderVerdict] {
         try await classify(senders: senders, corrections: [])
+    }
+
+    /// Default: not supported. Returning nothing leaves the messages in review, which is the
+    /// honest outcome for a transport that cannot answer.
+    func classify(
+        messages: [MessageClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [MessageVerdict] {
+        []
     }
 }
 
