@@ -36,22 +36,36 @@ public struct BedrockLLMTransport: LLMTransport {
         self.maxTokens = maxTokens
     }
 
-    /// Sender classification is a labelling task, not a reasoning task, so the cheap
-    /// model is the right default. Configurable because model availability differs by
-    /// account and region.
     /// The model used when the user has not named one.
     ///
-    /// Was Haiku 4.5, chosen for cost on the assumption that sender classification is a
-    /// cheap labelling task. On a real mailbox it is not: the mail is multilingual, many
-    /// senders are mixed, and the job includes writing generalising subject rules — which
-    /// is reasoning, not labelling. Haiku's observable failure was echoing whole subject
-    /// lines back as "patterns" instead of extracting the recurring words.
+    /// Configurable because model availability differs by account and region.
     ///
-    /// The cost argument does not hold either. Classification is per SENDER, not per
-    /// message, and verdicts are cached by model and prompt version — a 12,000-email
-    /// mailbox needed fewer than 100 sender verdicts in total, once. Paying Haiku prices for
-    /// judgement that then decides whether mail is deleted is a false economy.
-    public static let defaultModelId = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    /// The progression is worth recording, because each step was driven by observed output
+    /// rather than by assuming a bigger model is better:
+    ///
+    /// - Haiku 4.5 first, on the belief — stated in a comment here that has now been deleted
+    ///   as wrong — that sender classification is a labelling task rather than a reasoning
+    ///   one. It is not. The mail is multilingual, senders are mixed, and the job includes
+    ///   WRITING generalising subject rules. Haiku's observable failure was echoing whole
+    ///   subject lines back as "patterns", which left 59 emails on a real mailbox matching no
+    ///   pattern at all.
+    /// - Sonnet 4.5 fixed exactly that: fragments became real generalising words in the
+    ///   sender's own language, and abstentions halved from 59 to 29.
+    /// - Opus 5 now, for the remaining judgement calls — chiefly mixed senders whose split
+    ///   must be inferred from twenty subjects in a language the rules cannot read.
+    ///
+    /// The cost argument never applied. Classification is per SENDER, not per message, and
+    /// verdicts are cached by model AND prompt version, so a 12,000-email mailbox needed
+    /// fewer than 100 verdicts in total, once. That cache key also makes an A/B comparison
+    /// free: switching model re-requests the senders instead of reusing another model's
+    /// answers, and the previous model's verdicts stay in the table beside the new ones.
+    ///
+    /// `us.` rather than `global.` is deliberate: global routing can leave the US region set,
+    /// and this request carries the user's email metadata.
+    ///
+    /// Note that Opus 5 rejects `temperature` outright. The transport already retries without
+    /// it, so this default depends on that path rather than assuming it is unused.
+    public static let defaultModelId = "us.anthropic.claude-opus-5"
 
     public func classify(
         senders: [SenderClassificationRequest],

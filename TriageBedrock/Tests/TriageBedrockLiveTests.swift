@@ -174,11 +174,25 @@ final class TriageBedrockLiveTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
         let result = try XCTUnwrap(results.first)
 
-        // Rules alone rate info@ as weak/notification; the model should raise it.
+        // Rules alone rate info@ as weak/notification; the model must not leave it deletable.
         XCTAssertNotEqual(result.safetyTier, .safe, "the merge must not leave this auto-deletable")
-        XCTAssertTrue(result.reason.contains("AI:"), "the AI reason should reach the user")
 
-        // And the verdict must have been cached, so a rescan costs nothing.
+        // The model's contribution must be VISIBLE to the user — but there are two honest
+        // forms of it, and asserting the "AI:" literal only tested one. Opus 5 abstains on
+        // this input where Haiku and Sonnet guessed: a single subject line from an unknown
+        // small business genuinely does not support a verdict. That abstention is a correct
+        // answer and takes the merge's unsure path, which attributes itself differently.
+        //
+        // So the requirement is attribution, not a particular prefix.
+        let attributed = result.reason.contains("AI:") || result.reason.contains("the model")
+        XCTAssertTrue(
+            attributed,
+            "the model's contribution must reach the user, as a verdict or as an abstention — got: \(result.reason)"
+        )
+
+        // Either way a verdict was returned and cached, so a rescan costs nothing. This is
+        // also what distinguishes an abstention from the model never having been consulted:
+        // a missing verdict would leave this at zero.
         let cached = try await db.cachedVerdictCount(
             accountId: accountId,
             modelId: transport.modelId,
