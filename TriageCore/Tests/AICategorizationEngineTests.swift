@@ -402,8 +402,14 @@ final class AICategorizationEngineTests: XCTestCase {
         var account = EmailAccount(email: "me@example.com", provider: .gmail, createdAt: Date())
         try await db.saveAccount(&account)
 
-        // 120 distinct unresolvable senders -> 3 batches at 50 per call.
-        let emails = (0..<120).map { email("m\($0)", sender: "s\($0)@unknownsite.org") }
+        // Derived from the constant rather than restating it: batchSize is a quality/cost
+        // tuning knob and was lowered from 50 to 10 to give each sender real attention, so a
+        // hardcoded expectation here only asserts that nobody has retuned it.
+        let senderCount = 120
+        let expectedBatches = Int(
+            (Double(senderCount) / Double(AICategorizationEngine.batchSize)).rounded(.up)
+        )
+        let emails = (0..<senderCount).map { email("m\($0)", sender: "s\($0)@unknownsite.org") }
         let transport = MockTransport()
         let engine = AICategorizationEngine(
             rules: RuleBasedEngine(), transport: transport, cache: db, accountId: account.id!
@@ -411,8 +417,12 @@ final class AICategorizationEngineTests: XCTestCase {
 
         _ = try await engine.categorize(emails: emails)
 
-        XCTAssertEqual(transport.callCount, 3)
-        XCTAssertEqual(transport.sendersAsked.count, 120)
+        XCTAssertEqual(transport.callCount, expectedBatches)
+        XCTAssertEqual(transport.sendersAsked.count, senderCount)
+        XCTAssertTrue(
+            transport.receivedBatches.allSatisfy { $0.count <= AICategorizationEngine.batchSize },
+            "no batch may exceed the configured size"
+        )
     }
 
     // MARK: - Prompt contract

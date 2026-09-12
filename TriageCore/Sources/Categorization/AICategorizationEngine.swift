@@ -44,7 +44,18 @@ public final class AICategorizationEngine: CategorizationEngine {
     public static let ruleConfidenceCeiling = 0.7
 
     /// Senders per model call.
-    public static let batchSize = 50
+    /// How many senders go into one model call.
+    ///
+    /// Was 50, which was sized for cost rather than quality and got neither. Fifty senders
+    /// each carrying eight subjects and a body preview is a very large prompt, and the
+    /// model's attention divides across all of them — every sender gets a shallow pass, and
+    /// the per-sender reasoning this whole design depends on is exactly what suffers.
+    ///
+    /// Ten is small enough that a sender's samples can actually be read against each other,
+    /// which is what deciding a mixed sender requires. The extra calls are cheap: a real
+    /// mailbox needed roughly 76 sender verdicts in total, so this is single-digit call
+    /// counts either way, and they are cached per model and prompt version.
+    public static let batchSize = 10
 
     private let rules: RuleBasedEngine
     private let transport: LLMTransport
@@ -206,7 +217,7 @@ public final class AICategorizationEngine: CategorizationEngine {
         var requests: [SenderClassificationRequest] = []
         for sender in senders {
             let senderEmails = (grouped[sender] ?? []).sorted { $0.date > $1.date }
-            var subjects = senderEmails.prefix(5).map(\.subject)
+            var subjects = Self.representativeSubjects(of: senderEmails)
             if subjects.isEmpty {
                 subjects = await sampleSubjects(sender)
             }
@@ -243,8 +254,50 @@ public final class AICategorizationEngine: CategorizationEngine {
         return requests
     }
 
-    static func providerCounts(of emails: [EmailMetadata]) -> [String: Int] {
-        var counts: [String: Int] = [:]
+    /// Subjects spread across a sender's history, newest first, deduplicated.
+    ///
+    /// Taking the newest N was actively misleading. A rail operator's most recent eight
+    /// subjects were all winter promotions, so the model saw a seasonal marketing sender and
+    /// produced fragments describing that one campaign — none of which matched the operator's
+    /// year-round receipts and service alerts. Sampling evenly across the date range shows
+    /// what the sender actually does over time, which is the only basis on which a
+    /// generalising rule can be written.
+    ///
+    /// Near-duplicate subjects are collapsed to their leading words, because twelve
+    /// "Daily Activity Statement for <date>" messages teach the model nothing that one does,
+    /// while crowding out the variety that would.
+    static func representativeSubjects(of emails: [EmailMetadata], limit: Int = 20) -> [String] {
+        guard !emails.isEmpty else { return [] }
+
+        let stride = max(1, emails.count / limit)
+        var picked: [String] = []
+        var seenShapes: Set<String> = []
+
+        for (index, email) in emails.enumerated() where index % stride == 0 {
+            // Collapse by the first four words, which is what makes a template recognisable
+            // while still telling apart genuinely different subjects.
+            let shape = email.subject
+                .lowercased()
+                .split(whereSeparator: { $0 == " " })
+                .prefix(4)
+                .joined(separator: " ")
+            guard seenShapes.insert(shape).inserted else { continue }
+            picked.append(email.subject)
+            if picked.count >= limit { break }
+        }
+
+        // A sender whose mail is nearly all one template yields very few shapes; top up from
+        // the newest so the model is not judging on two examples.
+        if picked.count < 5 {
+            for email in emails where !picked.contains(email.subject) {
+                picked.append(email.subject)
+                if picked.count >= 5 { break }
+            }
+        }
+        return picked
+    }
+
+    static func providerCounts(of emails: [EmailMetadata]) -> [String: Int] {        var counts: [String: Int] = [:]
         for email in emails {
             if let category = email.providerCategory {
                 counts[category.displayName, default: 0] += 1

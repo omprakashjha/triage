@@ -321,6 +321,78 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         XCTAssertEqual(merged.safetyTier, .review)
     }
 
+    func testWholeSubjectLinesAreRejectedAsFragments() {
+        // Regression from the live mailbox. Asked in prose for fragments that generalise,
+        // Haiku echoed whole subject lines back, each matching exactly the one message it
+        // came from — which left 59 emails matching no pattern at all. A fragment is a rule
+        // for unseen mail, so the word cap enforces in code what the prompt asks for.
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "info@email.ns.nl",
+                    "category": "promotion",
+                    "mustKeep": false,
+                    "isRealPerson": false,
+                    "confidence": 0.75,
+                    "reason": "mixed",
+                    "disposableSubjects": .array([
+                        // Copied subject lines: must be dropped.
+                        "zomer in eigen land met ns dagje uit-magazine",
+                        "ontdek 12 provinciegidsen en geniet van kortingen",
+                        // Genuine fragments: must survive.
+                        "korting",
+                        "dagje uit",
+                    ]),
+                    "keepSubjects": .array([
+                        "let op: werkzaamheden almere centrum - weesp",
+                        "werkzaamheden",
+                    ]),
+                ])
+            ])
+        ])
+
+        let verdicts = SenderClassificationPrompt.parseVerdicts(from: payload)
+
+        XCTAssertEqual(verdicts[0].disposableSubjects, ["korting", "dagje uit"])
+        XCTAssertEqual(verdicts[0].keepSubjects, ["werkzaamheden"])
+    }
+
+    func testRepresentativeSubjectsSpreadAcrossTimeInsteadOfTakingTheNewest() {
+        // The newest-N sample was actively misleading: a rail operator's most recent
+        // subjects were all one winter campaign, so the model described that campaign and
+        // missed the year-round receipts. Here the newest 10 are all one template and the
+        // older mail is varied — the sampler must surface the variety.
+        var emails: [EmailMetadata] = []
+        let now = Date()
+        for i in 0..<10 {
+            emails.append(email(
+                "new\(i)",
+                sender: "info@email.ns.nl",
+                subject: "Duurzame dinsdag: groen eropuit met de trein \(i)"
+            ))
+        }
+        for (i, subject) in ["Uw factuur van maart", "Werkzaamheden Almere", "Uw reisoverzicht"]
+            .enumerated()
+        {
+            var old = email("old\(i)", sender: "info@email.ns.nl", subject: subject)
+            old.date = now.addingTimeInterval(-Double(i + 1) * 86400 * 90)
+            emails.append(old)
+        }
+
+        let picked = AICategorizationEngine.representativeSubjects(
+            of: emails.sorted { $0.date > $1.date }
+        )
+
+        XCTAssertTrue(
+            picked.contains { $0.contains("factuur") },
+            "the older transactional mail must be visible to the model"
+        )
+        XCTAssertLessThanOrEqual(
+            picked.filter { $0.contains("Duurzame dinsdag") }.count, 2,
+            "near-duplicate templates must not crowd out the variety"
+        )
+    }
+
     func testParsingReadsAbstentionAndSplits() {
         let payload = JSONValue.object([
             "verdicts": .array([

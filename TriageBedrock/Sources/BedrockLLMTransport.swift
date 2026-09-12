@@ -39,7 +39,19 @@ public struct BedrockLLMTransport: LLMTransport {
     /// Sender classification is a labelling task, not a reasoning task, so the cheap
     /// model is the right default. Configurable because model availability differs by
     /// account and region.
-    public static let defaultModelId = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    /// The model used when the user has not named one.
+    ///
+    /// Was Haiku 4.5, chosen for cost on the assumption that sender classification is a
+    /// cheap labelling task. On a real mailbox it is not: the mail is multilingual, many
+    /// senders are mixed, and the job includes writing generalising subject rules — which
+    /// is reasoning, not labelling. Haiku's observable failure was echoing whole subject
+    /// lines back as "patterns" instead of extracting the recurring words.
+    ///
+    /// The cost argument does not hold either. Classification is per SENDER, not per
+    /// message, and verdicts are cached by model and prompt version — a 12,000-email
+    /// mailbox needed fewer than 100 sender verdicts in total, once. Paying Haiku prices for
+    /// judgement that then decides whether mail is deleted is a false economy.
+    public static let defaultModelId = "us.anthropic.claude-sonnet-4-5-20250929-v1:0"
 
     public func classify(
         senders: [SenderClassificationRequest],

@@ -246,7 +246,7 @@ public extension LLMTransport {
 /// classifier whose output shape can drift is a classifier that will eventually
 /// mis-assign a tier.
 public enum SenderClassificationPrompt {
-    public static let version = "sender.v2"
+    public static let version = "sender.v3"
 
     public static let system = """
         You classify EMAIL SENDERS for an inbox cleanup tool. For each sender you are \
@@ -288,9 +288,25 @@ public enum SenderClassificationPrompt {
         or when the provider filed their mail under more than one heading:
         - put short subject fragments identifying the DISPOSABLE mail in disposableSubjects
         - put short subject fragments identifying the mail that MUST BE KEPT in keepSubjects
-        Use the sender's own language for these fragments, taken from the subjects you were \
-        shown, and keep them specific enough not to match the other group. Leave both empty \
-        for a sender whose mail is all one kind.
+
+        A FRAGMENT MUST GENERALISE. It is a rule for mail you have not seen, not a label \
+        for the samples in front of you. Use ONE TO THREE WORDS that recur across many of \
+        this sender's messages, in the sender's own language. NEVER copy a whole subject \
+        line: a fragment that matches only the one message it came from is useless, and \
+        every message it fails to match is left unclassified.
+
+        Good, because they recur:
+          keepSubjects: ["activity statement", "trade confirmation"]
+          disposableSubjects: ["korting", "aanbieding", "magazine"]
+
+        Bad, because each matches exactly one message:
+          disposableSubjects: ["zomer in eigen land met ns dagje uit-magazine"]
+          keepSubjects: ["let op: werkzaamheden almere centrum - weesp"]
+
+        Prefer the shortest fragment that does not also match the other group. If you \
+        cannot find fragments that generalise, leave BOTH lists empty and give the sender \
+        a single verdict instead — that is a better answer than a split that covers almost \
+        nothing. Leave both empty for a sender whose mail is all one kind.
 
         Judge on the evidence given. When the samples are ambiguous, prefer mustKeep=true — \
         the cost of wrongly keeping a promotion is one extra row in a list, and the cost of \
@@ -433,10 +449,21 @@ public enum SenderClassificationPrompt {
             // untrusted input: trimmed, lowercased, length-capped, and anything trivially
             // short dropped. A one-character fragment would match nearly every subject and
             // could sweep a sender's entire mail into the disposable half.
+            //
+            // Also capped at FOUR WORDS, which is the check that matters in practice. Asked
+            // only in prose for fragments that generalise, the model echoed whole subject
+            // lines back — "zomer in eigen land met ns dagje uit-magazine" — each matching
+            // exactly the one message it came from. On a real mailbox that left 59 emails
+            // matching no pattern at all. The word cap separates the two cases cleanly: the
+            // fragments that worked ("daily activity statement", "korting") are one to three
+            // words, and a copied subject line is invariably longer.
             func fragments(_ key: String) -> [String] {
                 (entry[key]?.arrayValue ?? [])
                     .compactMap { $0.stringValue?.trimmingCharacters(in: .whitespacesAndNewlines) }
                     .filter { $0.count >= 3 && $0.count <= 60 }
+                    .filter { fragment in
+                        fragment.split(whereSeparator: { $0 == " " }).count <= 4
+                    }
                     .prefix(8)
                     .map { $0 }
             }
@@ -489,7 +516,7 @@ public enum SenderClassificationPrompt {
                 }
             }
             lines.append("  subjects:")
-            for subject in sender.sampleSubjects.prefix(8) {
+            for subject in sender.sampleSubjects.prefix(20) {
                 lines.append("    - \(subject)")
             }
             if !sender.sampleSnippets.isEmpty {
