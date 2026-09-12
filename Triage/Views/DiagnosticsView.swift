@@ -10,16 +10,30 @@ import TriageCore
 struct DiagnosticsView: View {
     @EnvironmentObject private var appState: AppState
 
+    /// A polled snapshot rather than an observed collection, so reading the log can never
+    /// invalidate a view while another view is updating.
+    @State private var snapshot: [DiagnosticLog.Entry] = []
+    @State private var isRecording = false
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
             Divider()
-            if !appState.diagnostics.isEnabled {
+            if !isRecording {
                 off
-            } else if appState.diagnostics.entries.isEmpty {
+            } else if snapshot.isEmpty {
                 waiting
             } else {
                 transcript
+            }
+        }
+        .task {
+            // Polling at 2Hz: fast enough to watch a reproduction happen, slow enough to be
+            // invisible next to the view updates being recorded.
+            while !Task.isCancelled {
+                isRecording = appState.diagnostics.isEnabled
+                snapshot = appState.diagnostics.entries
+                try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }
@@ -30,9 +44,10 @@ struct DiagnosticsView: View {
                 .font(.title2.weight(.semibold))
 
             Toggle("Record what the app does", isOn: Binding(
-                get: { appState.diagnostics.isEnabled },
+                get: { isRecording },
                 set: { on in
                     appState.diagnostics.isEnabled = on
+                    isRecording = on
                     if on {
                         appState.diagnostics.clear()
                         // The watchdog is what turns "the UI seems to freeze" into a measured
@@ -52,7 +67,7 @@ struct DiagnosticsView: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
-            if appState.diagnostics.isEnabled {
+            if isRecording {
                 HStack(spacing: 10) {
                     Button("Copy transcript") {
                         NSPasteboard.general.clearContents()
@@ -60,10 +75,13 @@ struct DiagnosticsView: View {
                             appState.diagnostics.transcript, forType: .string
                         )
                     }
-                    Button("Clear") { appState.diagnostics.clear() }
+                    Button("Clear") {
+                        appState.diagnostics.clear()
+                        snapshot = []
+                    }
                         .buttonStyle(.borderless)
                     Spacer()
-                    Text("\(appState.diagnostics.entries.count) entries")
+                    Text("\(snapshot.count) entries")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -98,7 +116,7 @@ struct DiagnosticsView: View {
     private var transcript: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
-                ForEach(appState.diagnostics.entries) { entry in
+                ForEach(snapshot) { entry in
                     Text(entry.line)
                         .font(.system(.caption2, design: .monospaced))
                         // A stall and an unexpected state change are what this is for, so they

@@ -13,7 +13,7 @@ import Combine
 /// queue would corrupt the very timing being measured. A ring buffer costs nothing and cannot
 /// stall its caller.
 @MainActor
-final class DiagnosticLog: ObservableObject {
+final class DiagnosticLog {
     struct Entry: Identifiable {
         let id = UUID()
         let at: Date
@@ -40,10 +40,21 @@ final class DiagnosticLog: ObservableObject {
     /// Bounded so a long session cannot grow it without limit.
     private static let capacity = 400
 
-    @Published private(set) var entries: [Entry] = []
+    /// NOT `@Published`, and that is the whole point.
+    ///
+    /// The first version published this, and the sidebar body logged into it — which means the
+    /// instrument mutated an observable object during a view update. That is the same
+    /// "publishing changes from within view updates" hazard being investigated, so the
+    /// instrument would have been a cause of the class of bug it exists to find. An instrument
+    /// that perturbs what it measures is worse than none.
+    ///
+    /// The diagnostics screen polls a snapshot instead, which costs a copy of at most 400 small
+    /// structs a second and cannot invalidate anyone's view mid-update.
+    private(set) var entries: [Entry] = []
+
     /// Off by default. Instrumentation that is always on is instrumentation that changes what it
     /// measures, and this records view-body evaluations, which are extremely frequent.
-    @Published var isEnabled = false
+    var isEnabled = false
 
     private var lastAt: Date?
     private var watchdog: Timer?

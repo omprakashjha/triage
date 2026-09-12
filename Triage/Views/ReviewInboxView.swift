@@ -47,7 +47,18 @@ struct ReviewInboxView: View {
 
     private var list: some View {
         ScrollView {
-            LazyVStack(alignment: .leading, spacing: 4) {
+            // VStack, NOT LazyVStack.
+            //
+            // The reported symptom was that this list stayed blank until the user switched to
+            // another app and back — the signature of content that has been given to a lazy
+            // container which never received the layout pass it needs, with the app switch
+            // forcing one. Corroborating detail: the Decide screen renders reliably and uses a
+            // plain ScrollView, and it is the only structural difference between them.
+            //
+            // Laziness buys nothing here regardless. The list is one row per SENDER, which was
+            // seven rows for a 103-email queue, and the per-message rows only exist while a
+            // sender is expanded.
+            VStack(alignment: .leading, spacing: 4) {
                 ForEach(bySender) { group in
                     senderSection(group.sender, group.emails)
                 }
