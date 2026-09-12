@@ -304,8 +304,18 @@ struct ReviewInboxView: View {
     }
 
     private func reload() async {
-        guard let accountId else { return }
+        guard let accountId else {
+            appState.diagnostics.log("review", "reload skipped: no target account yet")
+            return
+        }
+        appState.diagnostics.log("review", "reload start for account \(accountId)")
+        let started = Date()
         await appState.loadReviewQueue(accountId: accountId)
+        let ms = Date().timeIntervalSince(started) * 1000
+        appState.diagnostics.log(
+            "review",
+            String(format: "reload done in %.0fms, %d rows", ms, appState.reviewQueue.count)
+        )
         expandVisibleWhenSmall()
     }
 

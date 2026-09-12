@@ -9,6 +9,9 @@ final class AppState: ObservableObject {
     ///
     /// Account selection is a separate axis (the sidebar's `List` selection is typed to
     /// `EmailAccount`), so the chosen view is tracked here rather than folded into it.
+    /// Runtime record of what actually happened, for defects that only exist while running.
+    let diagnostics = DiagnosticLog()
+
     enum DetailRoute: Hashable {
         case overview
         case decide
@@ -17,9 +20,14 @@ final class AppState: ObservableObject {
         case history
         case evaluation
         case settings
+        case diagnostics
     }
 
-    @Published var detailRoute: DetailRoute = .overview
+    @Published var detailRoute: DetailRoute = .overview {
+        didSet {
+            diagnostics.log("route", "detailRoute \(oldValue) -> \(detailRoute)")
+        }
+    }
     @Published var goldenLabels: [GoldenLabel] = []
     @Published var evaluationReport: EvaluationReport?
     @Published var isEvaluating = false
@@ -36,10 +44,28 @@ final class AppState: ObservableObject {
     @Published var unsubscribeMessage: String?
     /// Senders that kept sending after a successful unsubscribe.
     @Published var sendersIgnoringUnsubscribe: [String] = []
-    @Published var accounts: [EmailAccount] = []
+    /// Instrumented: the sidebar renders from this, and the reported symptom is every sidebar
+    /// row disappearing — so whether this is empty at that moment is the first fact needed, and
+    /// the one I have been assuming rather than observing.
+    @Published var accounts: [EmailAccount] = [] {
+        didSet {
+            diagnostics.log(
+                "accounts",
+                "count \(oldValue.count) -> \(accounts.count)"
+                    + " [\(accounts.map { $0.email }.joined(separator: ", "))]"
+            )
+        }
+    }
     @Published var scanProgress: ScanProgress?
     @Published var isScanning = false
-    @Published var selectedAccount: EmailAccount?
+    @Published var selectedAccount: EmailAccount? {
+        didSet {
+            diagnostics.log(
+                "selection",
+                "selectedAccount \(oldValue?.email ?? "nil") -> \(selectedAccount?.email ?? "nil")"
+            )
+        }
+    }
     @Published var accountStats: AccountStats?
     @Published var actionPlan: ActionPlan?
     @Published var isExecuting = false

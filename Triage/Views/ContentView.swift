@@ -58,6 +58,8 @@ struct ContentView: View {
                         EvaluationView()
                     case .settings:
                         SettingsView()
+                    case .diagnostics:
+                        DiagnosticsView()
                     }
                 }
             }
@@ -70,6 +72,19 @@ struct ContentView: View {
         // selectedAccount was non-nil, so switching to Senders, History, Accuracy or
         // Settings — or losing the sidebar selection — made scanning unreachable.
         .toolbar {
+            // In the TOOLBAR, not only the sidebar, and with a keyboard shortcut. The defect
+            // being investigated removes every sidebar row, so a diagnostics screen reachable
+            // only from the sidebar would be unreachable at exactly the moment it is needed.
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    appState.detailRoute = .diagnostics
+                } label: {
+                    Label("Diagnostics", systemImage: "waveform.path.ecg")
+                }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+                .help("Record and read what the app is doing (⇧⌘D)")
+            }
+
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     Task { await appState.scanSelectedAccount() }
@@ -99,6 +114,19 @@ struct SidebarView: View {
     @State private var showDeleteConfirmation = false
 
     var body: some View {
+        // Records what the sidebar is about to render, every time it renders.
+        //
+        // This is the fact that distinguishes the two possible causes and that I have twice
+        // guessed at instead of observing: if body runs with accounts.count == 0, the data went
+        // away; if body does not run at all while the rows are missing, SwiftUI tore the List
+        // down; and if body runs with a non-zero count while the screen is blank, the List is
+        // rendering rows it was given and hiding them.
+        let _ = appState.diagnostics.log(
+            "sidebar",
+            "body: accounts=\(appState.accounts.count) route=\(appState.detailRoute)"
+                + " selected=\(appState.selectedAccount?.email ?? "nil")"
+        )
+
         // Deliberately NOT `List(selection: $appState.selectedAccount)`.
         //
         // The navigation rows below are Buttons that set `detailRoute`, and they sat inside a
@@ -196,6 +224,11 @@ struct SidebarView: View {
                     title: "Settings",
                     systemImage: "gearshape",
                     route: .settings
+                )
+                SidebarRouteRow(
+                    title: "Diagnostics",
+                    systemImage: "waveform.path.ecg",
+                    route: .diagnostics
                 )
             }
 
