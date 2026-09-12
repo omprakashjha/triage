@@ -32,7 +32,13 @@ public final class CorrectingEngine: CategorizationEngine {
         var remaining: [EmailMetadata] = []
 
         for email in emails {
-            if let correction = matchingCorrection(for: email) {
+            // A per-MESSAGE decision outranks even a correction: a correction is a general
+            // rule about a sender, and this is a specific instruction about this email. When
+            // the two disagree, the more specific one is the later and better-informed
+            // judgement.
+            if let decision = email.userDisposalDecision {
+                corrected[email.messageId] = Self.result(for: email, decision: decision)
+            } else if let correction = matchingCorrection(for: email) {
                 corrected[email.messageId] = Self.result(for: email, correction: correction)
             } else {
                 remaining.append(email)
@@ -53,6 +59,23 @@ public final class CorrectingEngine: CategorizationEngine {
         return candidates.first {
             $0.matches(senderEmail: email.senderEmail, subject: email.subject)
         }
+    }
+
+    static func result(
+        for email: EmailMetadata,
+        decision: DisposalDecision
+    ) -> CategorizationResult {
+        CategorizationResult(
+            messageId: email.messageId,
+            // The category the pipeline had settled on is kept: the user decided the message's
+            // FATE, not its classification, and overwriting the category would discard the
+            // model's reading for no reason.
+            category: email.category ?? .unknown,
+            safetyTier: decision.impliedTier,
+            confidence: 1.0,
+            reason: decision.displayName,
+            evidence: .strong
+        )
     }
 
     static func result(for email: EmailMetadata, correction: UserCorrection) -> CategorizationResult {

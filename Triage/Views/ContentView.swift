@@ -48,6 +48,8 @@ struct ContentView: View {
                         InboxOverviewView()
                     case .decide:
                         DecisionQueueView()
+                    case .review:
+                        ReviewInboxView()
                     case .senders:
                         SenderTriageView()
                     case .history:
@@ -144,6 +146,11 @@ struct SidebarView: View {
                     title: "Decide",
                     systemImage: "checklist",
                     route: .decide
+                )
+                SidebarRouteRow(
+                    title: "Review",
+                    systemImage: "tray.full",
+                    route: .review
                 )
                 SidebarRouteRow(
                     title: "Senders",

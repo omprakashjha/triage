@@ -12,6 +12,7 @@ final class AppState: ObservableObject {
     enum DetailRoute: Hashable {
         case overview
         case decide
+        case review
         case senders
         case history
         case evaluation
@@ -653,6 +654,65 @@ final class AppState: ObservableObject {
 
     func loadIgnoredUnsubscribes(accountId: Int64) async {
         sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
+    }
+
+    // MARK: - Review queue
+
+    @Published var reviewQueue: [EmailMetadata] = []
+    @Published var isLoadingReviewQueue = false
+    @Published var reviewStatus: String?
+
+    func loadReviewQueue(accountId: Int64) async {
+        isLoadingReviewQueue = true
+        defer { isLoadingReviewQueue = false }
+        do {
+            reviewQueue = try await database.emailsAwaitingReview(accountId: accountId)
+        } catch {
+            reviewQueue = []
+            reviewStatus = "Could not load the review queue: \(error.localizedDescription)"
+        }
+    }
+
+    /// Record a per-message decision and reflect it immediately.
+    ///
+    /// Re-categorizes only the affected mail rather than the mailbox, so a bulk accept of 54
+    /// emails takes effect at once. The decision outranks every classifier, so this is really
+    /// just writing the new tier through.
+    func recordDisposal(
+        _ decision: DisposalDecision,
+        messageIds: [String],
+        accountId: Int64
+    ) async {
+        guard !messageIds.isEmpty else { return }
+        do {
+            try await database.recordDisposalDecision(
+                decision, messageIds: messageIds, accountId: accountId
+            )
+            let affected = try await recategorizeMessages(
+                accountId: accountId, messageIds: messageIds
+            )
+            reviewStatus = decision == .dispose
+                ? "Marked \(affected) email\(affected == 1 ? "" : "s") as safe to delete."
+                : "Keeping \(affected) email\(affected == 1 ? "" : "s")."
+            await loadReviewQueue(accountId: accountId)
+        } catch {
+            reviewStatus = "Could not save that: \(error.localizedDescription)"
+        }
+    }
+
+    /// Re-run the engine over specific messages only.
+    @discardableResult
+    private func recategorizeMessages(
+        accountId: Int64,
+        messageIds: [String]
+    ) async throws -> Int {
+        let emails = try await database.emails(accountId: accountId, messageIds: messageIds)
+        guard !emails.isEmpty else { return 0 }
+        let contacts = try await database.knownContactEmails(accountId: accountId)
+        let engine = makeEngine(accountId: accountId, contacts: contacts)
+        let results = try await engine.categorize(emails: emails)
+        try await database.updateCategories(results, accountId: accountId)
+        return results.count
     }
 
     // MARK: - Active learning

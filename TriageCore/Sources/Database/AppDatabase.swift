@@ -388,6 +388,28 @@ public final class AppDatabase: Sendable {
             try db.rename(table: "goldenLabel_v11", to: "goldenLabel")
         }
 
+        migrator.registerMigration("v12_per_message_disposal_decision") { db in
+            // A per-MESSAGE decision, which nothing else in the schema could express.
+            // Corrections are per sender (optionally per subject pattern), and that is the
+            // right shape for teaching the classifier. It is the wrong shape for "these 54
+            // specific emails are fine to delete, except that one" — which is exactly the
+            // decision left once the model has read every message individually and the only
+            // open question is whether the user accepts its reads.
+            //
+            // Stored on the mail rather than derived, so it survives recategorization: the
+            // whole point is that re-running the engine must not discard an explicit human
+            // decision about a specific message.
+            try db.alter(table: "emailMetadata") { t in
+                t.add(column: "userDisposalDecision", .text)
+            }
+            try db.create(
+                index: "idx_emailMetadata_disposal",
+                on: "emailMetadata",
+                columns: ["accountId", "userDisposalDecision"],
+                ifNotExists: true
+            )
+        }
+
         try migrator.migrate(dbWriter)
     }
 }

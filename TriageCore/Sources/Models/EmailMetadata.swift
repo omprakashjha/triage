@@ -24,6 +24,15 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
     // Gmail-specific
     public var labels: [String]?       // Gmail label IDs
 
+    /// An explicit human decision about THIS message, overriding everything else.
+    ///
+    /// Distinct from a correction, which teaches the classifier about a sender. This says
+    /// nothing about the sender and everything about one message: "this specific email is
+    /// fine to delete" or "keep this one". It is the decision left when the model has read
+    /// each message individually and the only open question is whether the user accepts its
+    /// reads — and it is the one shape the rest of the schema could not express.
+    public var userDisposalDecision: DisposalDecision?
+
     /// Gmail's OWN classification of this message, from its label IDs.
     ///
     /// Worth far more than it looks. Gmail's classifier is multilingual and trained on
@@ -124,6 +133,7 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
         case id, accountId, messageId, threadId, sender, senderEmail
         case subject, date, snippet
         case hasListUnsubscribe, listUnsubscribeHeader, supportsOneClickUnsubscribe, replyTo
+        case userDisposalDecision
         case labels, isUnread
         case category, safetyTier, categoryConfidence, categoryReason
         case actionTaken, actionDate, actionExecutedAt
@@ -138,8 +148,32 @@ public struct EmailMetadata: Identifiable, Codable, FetchableRecord, Persistable
 // MARK: - Enums
 
 /// Email categories assigned by the rule engine or AI
-public enum EmailCategory: String, Codable, CaseIterable, Sendable {
-    case newsletter
+/// A human decision about one specific message.
+///
+/// The final word in the pipeline. Nothing — no rule, no provider label, no model verdict —
+/// overrides it, because unlike every other input it is not an estimate.
+public enum DisposalDecision: String, Codable, Sendable, CaseIterable {
+    /// Fine to delete.
+    case dispose
+    /// Keep, regardless of what anything else concluded.
+    case keep
+
+    public var impliedTier: SafetyTier {
+        switch self {
+        case .dispose: return .safe
+        case .keep: return .protected_
+        }
+    }
+
+    public var displayName: String {
+        switch self {
+        case .dispose: return "You approved deleting this"
+        case .keep: return "You chose to keep this"
+        }
+    }
+}
+
+public enum EmailCategory: String, Codable, CaseIterable, Sendable {    case newsletter
     case promotion
     case notification
     case transactional

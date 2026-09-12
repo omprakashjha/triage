@@ -25,6 +25,64 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
 
     // MARK: - Corrections outrank everything
 
+    // MARK: - Per-message decisions
+
+    func testPerMessageDecisionOutranksACorrection() async throws {
+        // A correction is a general rule about a sender; a per-message decision is a specific
+        // instruction about one email. When they disagree the specific one is the later and
+        // better-informed judgement, so it wins.
+        let correction = UserCorrection(
+            accountId: 1, senderEmail: "info@email.ns.nl",
+            category: .transactional, mustKeep: true
+        )
+        var mail = email(sender: "info@email.ns.nl", subject: "Maak kans op gratis treinen")
+        mail.userDisposalDecision = .dispose
+        mail.category = .promotion
+
+        let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [correction])
+        let results = try await engine.categorize(emails: [mail])
+
+        XCTAssertEqual(results[0].safetyTier, .safe)
+        XCTAssertTrue(results[0].reason.contains("You approved"))
+    }
+
+    func testPerMessageKeepBeatsEverything() async throws {
+        var mail = email(sender: "x@deals.someshop.com", subject: "Weekend sale")
+        mail.userDisposalDecision = .keep
+        mail.labels = ["CATEGORY_PROMOTIONS"]
+
+        let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [])
+        let results = try await engine.categorize(emails: [mail])
+
+        XCTAssertEqual(
+            results[0].safetyTier, .protected_,
+            "an explicit keep must survive a listed promo domain AND provider corroboration"
+        )
+    }
+
+    func testPerMessageDecisionKeepsTheModelsCategory() async throws {
+        // The user decided the message's FATE, not its classification. Overwriting the
+        // category would discard the model's reading for no reason.
+        var mail = email(sender: "info@email.ns.nl", subject: "Korting op reizen")
+        mail.category = .promotion
+        mail.userDisposalDecision = .keep
+
+        let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [])
+        let results = try await engine.categorize(emails: [mail])
+
+        XCTAssertEqual(results[0].category, .promotion)
+        XCTAssertEqual(results[0].safetyTier, .protected_)
+    }
+
+    func testMailWithNoDecisionIsUnaffected() async throws {
+        let mail = email(sender: "x@deals.someshop.com", subject: "Weekend sale")
+        let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [])
+        let results = try await engine.categorize(emails: [mail])
+
+        XCTAssertFalse(results[0].reason.contains("You approved"))
+        XCTAssertFalse(results[0].reason.contains("You chose"))
+    }
+
     func testCorrectionOverridesTheRules() async throws {
         // The rules would call this promotional on the strength of a listed domain. The
         // user has said otherwise, and the user is not guessing.
