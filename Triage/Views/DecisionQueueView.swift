@@ -15,7 +15,16 @@ import TriageCore
 /// this app can gather that can actually measure it.
 struct DecisionQueueView: View {
     @EnvironmentObject private var appState: AppState
-    @State private var index = 0
+    /// Senders the user passed on this session.
+    ///
+    /// Tracked instead of an index into the candidate list, because the list RELOADS after
+    /// every decision — a decided sender drops out of the query entirely. An index into a
+    /// shrinking list silently points at the wrong sender, or past the end, and that coupling
+    /// is what made the first version of this screen appear stuck.
+    ///
+    /// Skips are intentionally not persisted: passing on a sender means "not now", not "never
+    /// ask me again", so they return next time the screen is opened.
+    @State private var skipped: Set<String> = []
     @State private var overriding = false
     @State private var chosenCategory: EmailCategory = .promotion
     @State private var chosenMustKeep = true
@@ -47,9 +56,12 @@ struct DecisionQueueView: View {
         }
     }
 
+    private var pending: [TriageCandidate] {
+        appState.triageCandidates.filter { !skipped.contains($0.senderEmail) }
+    }
+
     private var current: TriageCandidate? {
-        guard index < appState.triageCandidates.count else { return nil }
-        return appState.triageCandidates[index]
+        pending.first
     }
 
     private var header: some View {
@@ -71,10 +83,9 @@ struct DecisionQueueView: View {
                 }
             }
 
-            if !appState.triageCandidates.isEmpty {
-                let remaining = appState.triageCandidates.count - index
-                let mail = appState.triageCandidates[index...].reduce(0) { $0 + $1.pendingCount }
-                Text("\(remaining) decision\(remaining == 1 ? "" : "s") left, covering \(mail) emails")
+            if !pending.isEmpty {
+                let mail = pending.reduce(0) { $0 + $1.pendingCount }
+                Text("\(pending.count) decision\(pending.count == 1 ? "" : "s") left, covering \(mail) emails")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -91,16 +102,26 @@ struct DecisionQueueView: View {
 
     private var emptyState: some View {
         VStack(spacing: 8) {
-            Image(systemName: "checkmark.circle")
+            Image(systemName: skipped.isEmpty ? "checkmark.circle" : "arrow.uturn.backward.circle")
                 .font(.largeTitle)
-                .foregroundStyle(.green)
-            Text("Nothing left to decide")
+                .foregroundStyle(skipped.isEmpty ? .green : .secondary)
+            Text(skipped.isEmpty ? "Nothing left to decide" : "Only skipped senders left")
                 .font(.headline)
-            Text("Every sender with mail awaiting review has been ruled on. Scan again or widen the scan scope to find more.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 380)
+            // Distinguished because they mean different things: one is finished, the other is
+            // a set of deferrals the user may want back.
+            if skipped.isEmpty {
+                Text("Every sender with mail awaiting review has been ruled on. Scan again or widen the scan scope to find more.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 380)
+            } else {
+                Text("You skipped \(skipped.count) sender\(skipped.count == 1 ? "" : "s") and decided the rest.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Bring skipped senders back") { skipped.removeAll() }
+                    .font(.caption)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
@@ -246,7 +267,7 @@ struct DecisionQueueView: View {
 
             // Skip is deliberate: forcing a decision on a sender the user is unsure about
             // would poison the very ground truth this screen exists to collect.
-            Button("Skip") { advance() }
+            Button("Skip") { skipped.insert(candidate.senderEmail) }
                 .buttonStyle(.borderless)
                 .help("Leaves this sender undecided and records nothing.")
         }
@@ -291,10 +312,6 @@ struct DecisionQueueView: View {
                 .buttonStyle(.borderedProminent)
             }
         }
-    }
-
-    private func advance() {
-        if index < appState.triageCandidates.count { index += 1 }
     }
 
     private func tierColor(_ tier: SafetyTier) -> Color {

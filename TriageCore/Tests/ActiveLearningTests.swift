@@ -80,6 +80,44 @@ final class ActiveLearningTests: XCTestCase {
         XCTAssertTrue(candidates.isEmpty)
     }
 
+    func testConfirmedSendersAreNotAskedAgain() async throws {
+        // Regression. The exclusion checked userCorrection only, and a confirmation
+        // deliberately writes no correction — so confirming a sender did nothing visible: the
+        // candidate came straight back at the top of the queue and the same decision
+        // reappeared indefinitely. The existing exclusion test covered corrections and this
+        // path had none, which is exactly the gap that let it ship.
+        try await insert(sender: "confirmed@example.com", tier: .review, count: 18)
+        try await insert(sender: "fresh@example.com", tier: .review, count: 2)
+
+        try await db.confirmVerdict(
+            accountId: accountId, senderEmail: "confirmed@example.com",
+            category: .transactional, mustKeep: true
+        )
+
+        let candidates = try await db.triageCandidates(
+            accountId: accountId, modelId: model, promptVersion: prompt
+        )
+
+        XCTAssertEqual(
+            candidates.map(\.senderEmail), ["fresh@example.com"],
+            "a confirmed sender has been ruled on and must not be asked about again"
+        )
+    }
+
+    func testConfirmingIsIdempotent() async throws {
+        // The user pressed the button repeatedly when nothing appeared to happen. That must
+        // leave one label, not a pile of them.
+        try await insert(sender: "x@example.com", tier: .review, count: 4)
+        for _ in 0..<5 {
+            try await db.confirmVerdict(
+                accountId: accountId, senderEmail: "x@example.com",
+                category: .promotion, mustKeep: false
+            )
+        }
+        let labels = try await db.fetchGoldenLabels(accountId: accountId)
+        XCTAssertEqual(labels.count, 1)
+    }
+
     func testAlreadyCorrectedSendersAreNotAskedAgain() async throws {
         // The only resource this feature spends is the user's attention, so asking twice is
         // the one thing it must not do.

@@ -44,10 +44,23 @@ public extension AppDatabase {
                        AND v.promptVersion = ?
                     WHERE e.accountId = ?
                       AND e.safetyTier IS NOT 'protected_'
+                      -- Excluded by EITHER route the user can rule on a sender.
+                      --
+                      -- Originally only corrections were checked, which made confirming a
+                      -- sender do nothing visible: a confirmation deliberately writes no
+                      -- correction, so the candidate came straight back at the top of the
+                      -- queue and the same decision reappeared indefinitely. The label is
+                      -- what records "the user has ruled on this", whichever button produced
+                      -- it, so the label table is what the exclusion must consult.
                       AND NOT EXISTS (
                             SELECT 1 FROM userCorrection c
                             WHERE c.accountId = e.accountId
                               AND c.senderEmail = LOWER(e.senderEmail)
+                          )
+                      AND NOT EXISTS (
+                            SELECT 1 FROM goldenLabel g
+                            WHERE g.accountId = e.accountId
+                              AND g.senderEmail = LOWER(e.senderEmail)
                           )
                     GROUP BY LOWER(e.senderEmail)
                     HAVING pendingCount > 0
