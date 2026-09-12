@@ -11,6 +11,7 @@ final class AppState: ObservableObject {
     /// `EmailAccount`), so the chosen view is tracked here rather than folded into it.
     enum DetailRoute: Hashable {
         case overview
+        case decide
         case senders
         case history
         case evaluation
@@ -90,6 +91,18 @@ final class AppState: ObservableObject {
     /// action is never dead just because a selection was lost — which is exactly how the
     /// old in-view Scan button became unreachable.
     var scanTarget: EmailAccount? {
+        selectedAccount ?? accounts.first
+    }
+
+    /// Which account the Settings screen reads and writes.
+    ///
+    /// Same fallback, for the same reason. Settings gated its whole data load on an explicit
+    /// sidebar selection, so with none it loaded nothing at all — the corrections list read
+    /// "None yet" while 29 were stored, and the button that turns them into evaluation labels
+    /// only renders when the list is non-empty, so it was unreachable. A screen the user
+    /// navigated to deliberately should act on the obvious account rather than wait to be
+    /// told which one.
+    var settingsTarget: EmailAccount? {
         selectedAccount ?? accounts.first
     }
 
@@ -642,6 +655,107 @@ final class AppState: ObservableObject {
         sendersIgnoringUnsubscribe = (try? await database.sendersIgnoringUnsubscribe(accountId: accountId)) ?? []
     }
 
+    // MARK: - Active learning
+
+    @Published var triageCandidates: [TriageCandidate] = []
+    @Published var isLoadingCandidates = false
+    @Published var agreement: (confirmed: Int, overturned: Int) = (0, 0)
+
+    /// Load the senders worth asking about, highest leverage first.
+    func loadTriageCandidates(accountId: Int64) async {
+        isLoadingCandidates = true
+        defer { isLoadingCandidates = false }
+
+        // Keyed to the CURRENT model and prompt, so the queue shows the verdict the user
+        // would actually be endorsing rather than one from a superseded configuration.
+        let transport = currentTransportIdentity()
+        do {
+            triageCandidates = try await database.triageCandidates(
+                accountId: accountId,
+                modelId: transport.modelId,
+                promptVersion: transport.promptVersion
+            )
+            agreement = try await database.agreementRate(accountId: accountId)
+        } catch {
+            triageCandidates = []
+            correctionStatus = "Could not load the decision queue: \(error.localizedDescription)"
+        }
+    }
+
+    /// Which model's verdicts to show, without constructing a transport that would talk to AWS.
+    private func currentTransportIdentity() -> (modelId: String, promptVersion: String) {
+        let configured = settings?.aiConfig.modelId ?? ""
+        return (
+            configured.isEmpty ? BedrockLLMTransport.defaultModelId : configured,
+            SenderClassificationPrompt.version
+        )
+    }
+
+    /// The user endorses what the app says about this sender.
+    ///
+    /// Records ground truth and changes nothing else. That is deliberate: a confirmation is
+    /// the only label this app can collect that is able to measure the pipeline, because a
+    /// correction forces the outcome it is then scored against.
+    func confirmCandidate(_ candidate: TriageCandidate, accountId: Int64) async {
+        guard let category = candidate.currentCategory else { return }
+        do {
+            try await database.confirmVerdict(
+                accountId: accountId,
+                senderEmail: candidate.senderEmail,
+                category: category,
+                mustKeep: candidate.currentTier != .safe
+            )
+            correctionStatus = "Confirmed \(candidate.senderEmail)"
+                + " — recorded as ground truth, nothing re-categorized."
+            await loadTriageCandidates(accountId: accountId)
+        } catch {
+            correctionStatus = "Could not record the confirmation: \(error.localizedDescription)"
+        }
+    }
+
+    /// The user overturns the verdict: writes a correction AND a label.
+    func decideCandidate(
+        _ candidate: TriageCandidate,
+        accountId: Int64,
+        category: EmailCategory,
+        mustKeep: Bool,
+        subjectPattern: String? = nil
+    ) async {
+        let correction = UserCorrection(
+            accountId: accountId,
+            senderEmail: candidate.senderEmail,
+            subjectPattern: subjectPattern,
+            category: category,
+            mustKeep: mustKeep,
+            previousCategory: candidate.currentCategory,
+            previousTier: candidate.currentTier,
+            previousReason: candidate.currentReason
+        )
+        do {
+            try await database.saveCorrection(correction)
+            try await database.saveGoldenLabel(
+                GoldenLabel(
+                    accountId: accountId,
+                    senderEmail: candidate.senderEmail,
+                    subjectPattern: subjectPattern,
+                    expectedCategory: category,
+                    disposition: mustKeep ? .mustKeep : .disposable,
+                    note: LabelProvenance.correction.note
+                )
+            )
+            await loadCorrections(accountId: accountId)
+            let affected = try await recategorizeSender(
+                accountId: accountId,
+                senderEmail: candidate.senderEmail
+            )
+            correctionStatus = "Set \(candidate.senderEmail) to \(category.displayName)"
+                + " — \(affected) message\(affected == 1 ? "" : "s") updated."
+            await loadTriageCandidates(accountId: accountId)
+        } catch {
+            correctionStatus = "Could not save the decision: \(error.localizedDescription)"
+        }
+    }
+
     // MARK: - Corrections
 
     func loadCorrections(accountId: Int64) async {
@@ -720,7 +834,7 @@ final class AppState: ObservableObject {
             let written = try await database.promoteCorrectionsToGoldenLabels(accountId: accountId)
             await loadGoldenLabels(accountId: accountId)
             correctionStatus = written == 0
-                ? "No sender-wide corrections to add. Subject-scoped ones can't become labels, since the evaluation set is keyed by sender."
+                ? "No corrections to add yet."
                 : "Added \(written) correction\(written == 1 ? "" : "s") to the evaluation set."
         } catch {
             correctionStatus = "Could not update the evaluation set: \(error.localizedDescription)"

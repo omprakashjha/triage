@@ -32,19 +32,25 @@ public struct CategorizationEvaluator: Sendable {
         accountId: Int64 = 1,
         now: Date = Date()
     ) -> EvaluationReport {
-        let labelsBySender = Dictionary(
-            labels.map { ($0.senderEmail.lowercased(), $0) },
-            uniquingKeysWith: { first, _ in first }
-        )
+        // Grouped by sender, narrowest first. A sender may now carry several labels — one
+        // per subject scope — because the senders worth measuring are exactly the mixed ones
+        // that a single label cannot describe.
+        let labelsBySender = Dictionary(grouping: labels) { $0.senderEmail.lowercased() }
+            .mapValues { $0.sorted { $0.specificity > $1.specificity } }
         let resultsById = Dictionary(
             results.map { ($0.messageId, $0) },
             uniquingKeysWith: { first, _ in first }
         )
 
-        // Only mail from a labelled sender can be scored.
+        // Only mail matching a label can be scored, and the NARROWEST match wins — a
+        // subject-scoped label describes its messages better than the sender-wide one it
+        // sits inside, so scoring against the broad label would mark correct behaviour wrong.
         var scored: [(email: EmailMetadata, result: CategorizationResult, label: GoldenLabel)] = []
         for email in emails {
-            guard let label = labelsBySender[email.senderEmail.lowercased()],
+            guard let candidates = labelsBySender[email.senderEmail.lowercased()],
+                  let label = candidates.first(where: {
+                      $0.matches(senderEmail: email.senderEmail, subject: email.subject)
+                  }),
                   let result = resultsById[email.messageId] else { continue }
             scored.append((email, result, label))
         }

@@ -181,7 +181,8 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         let receipt = verdict.resolved(forSubject: "Uw factuur van maart")
         XCTAssertTrue(receipt.mustKeep)
         XCTAssertEqual(receipt.category, .transactional, "a kept message is not promotional")
-        XCTAssertEqual(receipt.impliedTier, .review)
+        // Settled, not pending: the model read this message and decided to keep it.
+        XCTAssertEqual(receipt.impliedTier, .protected_)
     }
 
     func testUnmatchedMessageFromAMixedSenderIsKept() {
@@ -319,6 +320,185 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.safetyTier, .review)
+    }
+
+    func testWholeSubjectLinesAreRejectedAsFragments() {
+        // Regression from the live mailbox. Asked in prose for fragments that generalise,
+        // Haiku echoed whole subject lines back, each matching exactly the one message it
+        // came from — which left 59 emails matching no pattern at all. A fragment is a rule
+        // for unseen mail, so the word cap enforces in code what the prompt asks for.
+        let payload = JSONValue.object([
+            "verdicts": .array([
+                .object([
+                    "senderEmail": "info@email.ns.nl",
+                    "category": "promotion",
+                    "mustKeep": false,
+                    "isRealPerson": false,
+                    "confidence": 0.75,
+                    "reason": "mixed",
+                    "disposableSubjects": .array([
+                        // Copied subject lines: must be dropped.
+                        "zomer in eigen land met ns dagje uit-magazine",
+                        "ontdek 12 provinciegidsen en geniet van kortingen",
+                        // Genuine fragments: must survive.
+                        "korting",
+                        "dagje uit",
+                    ]),
+                    "keepSubjects": .array([
+                        "let op: werkzaamheden almere centrum - weesp",
+                        "werkzaamheden",
+                    ]),
+                ])
+            ])
+        ])
+
+        let verdicts = SenderClassificationPrompt.parseVerdicts(from: payload)
+
+        XCTAssertEqual(verdicts[0].disposableSubjects, ["korting", "dagje uit"])
+        XCTAssertEqual(verdicts[0].keepSubjects, ["werkzaamheden"])
+    }
+
+    func testRepresentativeSubjectsSpreadAcrossTimeInsteadOfTakingTheNewest() {
+        // The newest-N sample was actively misleading: a rail operator's most recent
+        // subjects were all one winter campaign, so the model described that campaign and
+        // missed the year-round receipts. Here the newest 10 are all one template and the
+        // older mail is varied — the sampler must surface the variety.
+        var emails: [EmailMetadata] = []
+        let now = Date()
+        for i in 0..<10 {
+            emails.append(email(
+                "new\(i)",
+                sender: "info@email.ns.nl",
+                subject: "Duurzame dinsdag: groen eropuit met de trein \(i)"
+            ))
+        }
+        for (i, subject) in ["Uw factuur van maart", "Werkzaamheden Almere", "Uw reisoverzicht"]
+            .enumerated()
+        {
+            var old = email("old\(i)", sender: "info@email.ns.nl", subject: subject)
+            old.date = now.addingTimeInterval(-Double(i + 1) * 86400 * 90)
+            emails.append(old)
+        }
+
+        let picked = AICategorizationEngine.representativeSubjects(
+            of: emails.sorted { $0.date > $1.date }
+        )
+
+        XCTAssertTrue(
+            picked.contains { $0.contains("factuur") },
+            "the older transactional mail must be visible to the model"
+        )
+        XCTAssertLessThanOrEqual(
+            picked.filter { $0.contains("Duurzame dinsdag") }.count, 2,
+            "near-duplicate templates must not crowd out the variety"
+        )
+    }
+
+    // MARK: - Subject-scoped golden labels
+
+    func testEvaluatorScoresAgainstTheNarrowestMatchingLabel() {
+        // A sender with two scopes: its receipts must be kept, its marketing may go. Scoring
+        // both halves against one sender-wide label would mark correct behaviour wrong, which
+        // is why labels needed the same scope corrections already had.
+        let labels = [
+            GoldenLabel(
+                accountId: 1, senderEmail: "info@email.ns.nl",
+                expectedCategory: .promotion, disposition: .disposable
+            ),
+            GoldenLabel(
+                accountId: 1, senderEmail: "info@email.ns.nl", subjectPattern: "factuur",
+                expectedCategory: .transactional, disposition: .mustKeep
+            ),
+        ]
+
+        let receipt = email("a", sender: "info@email.ns.nl", subject: "Uw factuur van maart")
+        let promo = email("b", sender: "info@email.ns.nl", subject: "Korting op reizen")
+
+        let results = [
+            CategorizationResult(
+                messageId: "a", category: .transactional, safetyTier: .review,
+                confidence: 0.9, reason: "kept", evidence: .strong
+            ),
+            CategorizationResult(
+                messageId: "b", category: .promotion, safetyTier: .safe,
+                confidence: 0.9, reason: "marketing", evidence: .strong
+            ),
+        ]
+
+        let report = CategorizationEvaluator().evaluate(
+            emails: [receipt, promo], results: results, labels: labels, accountId: 1
+        )
+
+        XCTAssertEqual(report.evaluatedEmails, 2, "both halves are scoreable")
+        XCTAssertEqual(
+            report.categoryAccuracy, 1.0,
+            "each message scored against its own scope, so both are correct"
+        )
+    }
+
+    func testWholeSenderLabelStillCoversUnscopedMail() {
+        let labels = [
+            GoldenLabel(
+                accountId: 1, senderEmail: "x@shop.example",
+                expectedCategory: .promotion, disposition: .disposable
+            )
+        ]
+        let mail = email("a", sender: "x@shop.example", subject: "Anything at all")
+        let results = [
+            CategorizationResult(
+                messageId: "a", category: .promotion, safetyTier: .safe,
+                confidence: 0.9, reason: "r", evidence: .strong
+            )
+        ]
+
+        let report = CategorizationEvaluator().evaluate(
+            emails: [mail], results: results, labels: labels, accountId: 1
+        )
+        XCTAssertEqual(report.evaluatedEmails, 1)
+    }
+
+    func testReviewMeansUndecidedAndNothingElse() {
+        // The whole point of the tier fix. Measured on a real mailbox, 219 emails sat in
+        // review and 131 of them were there because the model had DECIDED to keep them —
+        // finished work presented as an open question, which is why confirming 28 senders
+        // produced no visible change and the user concluded the reviewing was not happening.
+        //
+        // review is now reserved for the absence of a decision.
+        let decidedKeep = SenderVerdict(
+            senderEmail: "bank@example.com", category: .transactional, mustKeep: true,
+            isRealPerson: false, confidence: 0.95, reason: "statements"
+        )
+        let decidedDispose = SenderVerdict(
+            senderEmail: "shop@example.com", category: .promotion, mustKeep: false,
+            isRealPerson: false, confidence: 0.9, reason: "marketing"
+        )
+        let undecided = SenderVerdict(
+            senderEmail: "who@example.com", category: .unknown, mustKeep: true,
+            isRealPerson: false, confidence: 0.3, reason: "cannot tell", isUnsure: true
+        )
+
+        XCTAssertEqual(decidedKeep.impliedTier, .protected_, "a keep decision is settled")
+        XCTAssertEqual(decidedDispose.impliedTier, .safe, "a dispose decision is settled")
+        XCTAssertEqual(undecided.impliedTier, .review, "only an abstention is pending")
+    }
+
+    func testTheTierFixCannotMakeMailMoreDeletable() {
+        // Guard on the direction of the change: every tier this moved went AWAY from
+        // actionable, so it cannot cause data loss. If a future edit inverts that, this fails.
+        for mustKeep in [true, false] {
+            for unsure in [true, false] {
+                let v = SenderVerdict(
+                    senderEmail: "x@example.com", category: .promotion, mustKeep: mustKeep,
+                    isRealPerson: false, confidence: 0.9, reason: "r", isUnsure: unsure
+                )
+                if mustKeep || unsure {
+                    XCTAssertNotEqual(
+                        v.impliedTier, .safe,
+                        "keep or unsure must never be auto-actionable"
+                    )
+                }
+            }
+        }
     }
 
     func testParsingReadsAbstentionAndSplits() {

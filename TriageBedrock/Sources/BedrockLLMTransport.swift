@@ -36,10 +36,36 @@ public struct BedrockLLMTransport: LLMTransport {
         self.maxTokens = maxTokens
     }
 
-    /// Sender classification is a labelling task, not a reasoning task, so the cheap
-    /// model is the right default. Configurable because model availability differs by
-    /// account and region.
-    public static let defaultModelId = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
+    /// The model used when the user has not named one.
+    ///
+    /// Configurable because model availability differs by account and region.
+    ///
+    /// The progression is worth recording, because each step was driven by observed output
+    /// rather than by assuming a bigger model is better:
+    ///
+    /// - Haiku 4.5 first, on the belief — stated in a comment here that has now been deleted
+    ///   as wrong — that sender classification is a labelling task rather than a reasoning
+    ///   one. It is not. The mail is multilingual, senders are mixed, and the job includes
+    ///   WRITING generalising subject rules. Haiku's observable failure was echoing whole
+    ///   subject lines back as "patterns", which left 59 emails on a real mailbox matching no
+    ///   pattern at all.
+    /// - Sonnet 4.5 fixed exactly that: fragments became real generalising words in the
+    ///   sender's own language, and abstentions halved from 59 to 29.
+    /// - Opus 5 now, for the remaining judgement calls — chiefly mixed senders whose split
+    ///   must be inferred from twenty subjects in a language the rules cannot read.
+    ///
+    /// The cost argument never applied. Classification is per SENDER, not per message, and
+    /// verdicts are cached by model AND prompt version, so a 12,000-email mailbox needed
+    /// fewer than 100 verdicts in total, once. That cache key also makes an A/B comparison
+    /// free: switching model re-requests the senders instead of reusing another model's
+    /// answers, and the previous model's verdicts stay in the table beside the new ones.
+    ///
+    /// `us.` rather than `global.` is deliberate: global routing can leave the US region set,
+    /// and this request carries the user's email metadata.
+    ///
+    /// Note that Opus 5 rejects `temperature` outright. The transport already retries without
+    /// it, so this default depends on that path rather than assuming it is unused.
+    public static let defaultModelId = "us.anthropic.claude-opus-5"
 
     public func classify(
         senders: [SenderClassificationRequest],
@@ -61,30 +87,97 @@ public struct BedrockLLMTransport: LLMTransport {
         let payload: JSONValue
         do {
             payload = try await send(
-                client, senders: senders, corrections: corrections, includeTemperature: true
+                client,
+                systemPrompt: SenderClassificationPrompt.systemPrompt(corrections: corrections),
+                userMessage: SenderClassificationPrompt.userMessage(for: senders),
+                schema: SenderClassificationPrompt.outputSchema,
+                toolName: SenderClassificationPrompt.toolName,
+                toolDescription: SenderClassificationPrompt.toolDescription,
+                includeTemperature: true
             )
         } catch BedrockTransportError.temperatureRejected {
             // Some newer models reject `temperature` outright (Opus 5 among them).
             // Retry once without it rather than making the user discover this per model.
             payload = try await send(
-                client, senders: senders, corrections: corrections, includeTemperature: false
+                client,
+                systemPrompt: SenderClassificationPrompt.systemPrompt(corrections: corrections),
+                userMessage: SenderClassificationPrompt.userMessage(for: senders),
+                schema: SenderClassificationPrompt.outputSchema,
+                toolName: SenderClassificationPrompt.toolName,
+                toolDescription: SenderClassificationPrompt.toolDescription,
+                includeTemperature: false
             )
         }
 
         return SenderClassificationPrompt.parseVerdicts(from: payload)
     }
 
+    /// Classify individual messages the sender pass could not decide.
+    public func classify(
+        messages: [MessageClassificationRequest],
+        corrections: [CorrectionExample]
+    ) async throws -> [MessageVerdict] {
+        guard !messages.isEmpty else { return [] }
+
+        let client: BedrockRuntimeClient
+        do {
+            let config = try await BedrockRuntimeClient
+                .BedrockRuntimeClientConfiguration(region: region)
+            client = BedrockRuntimeClient(config: config)
+        } catch {
+            throw BedrockTransportError.credentialsUnavailable
+        }
+
+        let system = MessageClassificationPrompt.systemPrompt(corrections: corrections)
+        let body = MessageClassificationPrompt.userMessage(for: messages)
+
+        let payload: JSONValue
+        do {
+            payload = try await send(
+                client,
+                systemPrompt: system,
+                userMessage: body,
+                schema: MessageClassificationPrompt.outputSchema,
+                toolName: MessageClassificationPrompt.toolName,
+                toolDescription: MessageClassificationPrompt.toolDescription,
+                includeTemperature: true
+            )
+        } catch BedrockTransportError.temperatureRejected {
+            payload = try await send(
+                client,
+                systemPrompt: system,
+                userMessage: body,
+                schema: MessageClassificationPrompt.outputSchema,
+                toolName: MessageClassificationPrompt.toolName,
+                toolDescription: MessageClassificationPrompt.toolDescription,
+                includeTemperature: false
+            )
+        }
+
+        return MessageClassificationPrompt.parseVerdicts(from: payload)
+    }
+
+    /// One request shape for both passes.
+    ///
+    /// Generalised rather than copied: every Bedrock failure mode worth translating - access
+    /// denied, model not found, throttling, the temperature rejection newer models need, and
+    /// credential resolution that only surfaces on the CALL - is handled here. A second
+    /// prompt with its own copy of that would drift, and the drift would show up as an
+    /// unhelpful error at the worst moment.
     private func send(
         _ client: BedrockRuntimeClient,
-        senders: [SenderClassificationRequest],
-        corrections: [CorrectionExample],
+        systemPrompt: String,
+        userMessage: String,
+        schema: JSONValue,
+        toolName: String,
+        toolDescription: String,
         includeTemperature: Bool
     ) async throws -> JSONValue {
         let tool = BedrockRuntimeClientTypes.Tool.toolspec(
             BedrockRuntimeClientTypes.ToolSpecification(
-                description: SenderClassificationPrompt.toolDescription,
-                inputSchema: .json(SenderClassificationPrompt.outputSchema.smithyDocument),
-                name: SenderClassificationPrompt.toolName
+                description: toolDescription,
+                inputSchema: .json(schema.smithyDocument),
+                name: toolName
             )
         )
 
@@ -97,19 +190,17 @@ public struct BedrockLLMTransport: LLMTransport {
             ),
             messages: [
                 BedrockRuntimeClientTypes.Message(
-                    content: [.text(SenderClassificationPrompt.userMessage(for: senders))],
+                    content: [.text(userMessage)],
                     role: .user
                 )
             ],
             modelId: modelId,
-            system: [.text(SenderClassificationPrompt.systemPrompt(corrections: corrections))],
+            system: [.text(systemPrompt)],
             toolConfig: BedrockRuntimeClientTypes.ToolConfiguration(
                 // Forced: prose instead of a tool call would mean parsing free text into
                 // a decision that sets a safety tier.
                 toolChoice: .tool(
-                    BedrockRuntimeClientTypes.SpecificToolChoice(
-                        name: SenderClassificationPrompt.toolName
-                    )
+                    BedrockRuntimeClientTypes.SpecificToolChoice(name: toolName)
                 ),
                 tools: [tool]
             )
@@ -147,7 +238,7 @@ public struct BedrockLLMTransport: LLMTransport {
             throw BedrockTransportError.modelUnavailable(text)
         }
 
-        return try Self.toolInput(from: output, expecting: SenderClassificationPrompt.toolName)
+        return try Self.toolInput(from: output, expecting: toolName)
     }
 
     /// Pulls the forced tool call out of the response.

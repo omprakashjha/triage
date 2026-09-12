@@ -348,6 +348,46 @@ public final class AppDatabase: Sendable {
             }
         }
 
+        migrator.registerMigration("v11_golden_label_subject_scope") { db in
+            // Sender-level labelling could not represent what users actually produce. Of 29
+            // real corrections, 26 were subject-scoped — splitting mixed senders, which is
+            // the hard case worth measuring — so only 3 could become labels, and a precision
+            // figure from 3 labels is not a measurement.
+            //
+            // The unique key must widen from (account, sender) to include the scope. SQLite
+            // will not drop the index backing a UNIQUE constraint, so the table is REBUILT
+            // and copied rather than altered — the first attempt tried `DROP INDEX` on
+            // sqlite_autoindex_goldenLabel_1 and failed, which the test suite caught before
+            // it reached a real database.
+            try db.create(table: "goldenLabel_v11") { t in
+                t.autoIncrementedPrimaryKey("id")
+                t.column("accountId", .integer).notNull()
+                    .references("emailAccount", onDelete: .cascade)
+                t.column("senderEmail", .text).notNull()
+                t.column("subjectPattern", .text)
+                t.column("expectedCategory", .text).notNull()
+                t.column("disposition", .text).notNull()
+                t.column("note", .text)
+                t.column("labelledAt", .datetime).notNull()
+
+                t.uniqueKey(["accountId", "senderEmail", "subjectPattern"])
+            }
+
+            // Existing labels are sender-wide by definition, so they carry a NULL scope.
+            // Ids are preserved so nothing holding a label id is invalidated.
+            try db.execute(sql: """
+                INSERT INTO goldenLabel_v11
+                    (id, accountId, senderEmail, subjectPattern, expectedCategory,
+                     disposition, note, labelledAt)
+                SELECT id, accountId, senderEmail, NULL, expectedCategory,
+                       disposition, note, labelledAt
+                FROM goldenLabel
+                """)
+
+            try db.drop(table: "goldenLabel")
+            try db.rename(table: "goldenLabel_v11", to: "goldenLabel")
+        }
+
         try migrator.migrate(dbWriter)
     }
 }
@@ -1141,12 +1181,25 @@ extension AppDatabase {
 
     public func saveGoldenLabel(_ label: GoldenLabel) async throws {
         try await dbWriter.write { db in
+            // SQLite treats NULL as distinct from NULL in a unique index, so a whole-sender
+            // label cannot be upserted by the constraint alone and is cleared explicitly —
+            // the same handling user corrections need, for the same reason.
+            if label.subjectPattern == nil {
+                try db.execute(
+                    sql: """
+                        DELETE FROM goldenLabel
+                        WHERE accountId = ? AND senderEmail = ? AND subjectPattern IS NULL
+                        """,
+                    arguments: [label.accountId, label.senderEmail.lowercased()]
+                )
+            }
             try db.execute(
                 sql: """
                     INSERT INTO goldenLabel
-                        (accountId, senderEmail, expectedCategory, disposition, note, labelledAt)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(accountId, senderEmail) DO UPDATE SET
+                        (accountId, senderEmail, subjectPattern, expectedCategory,
+                         disposition, note, labelledAt)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(accountId, senderEmail, subjectPattern) DO UPDATE SET
                         expectedCategory = excluded.expectedCategory,
                         disposition = excluded.disposition,
                         note = excluded.note,
@@ -1155,6 +1208,7 @@ extension AppDatabase {
                 arguments: [
                     label.accountId,
                     label.senderEmail.lowercased(),
+                    label.subjectPattern,
                     label.expectedCategory.rawValue,
                     label.disposition.rawValue,
                     label.note,

@@ -46,6 +46,8 @@ struct ContentView: View {
                     switch appState.detailRoute {
                     case .overview:
                         InboxOverviewView()
+                    case .decide:
+                        DecisionQueueView()
                     case .senders:
                         SenderTriageView()
                     case .history:
@@ -134,6 +136,14 @@ struct SidebarView: View {
                     title: "Inbox Overview",
                     systemImage: "tray.2",
                     route: .overview
+                )
+                // Placed second, directly after the overview: this is the screen that turns a
+                // long review queue into a few decisions, so it should be found before the
+                // per-sender and per-category lists a user would otherwise start scrolling.
+                SidebarRouteRow(
+                    title: "Decide",
+                    systemImage: "checklist",
+                    route: .decide
                 )
                 SidebarRouteRow(
                     title: "Senders",

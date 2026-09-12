@@ -52,7 +52,8 @@ final class AICategorizationEngineTests: XCTestCase {
         category: EmailCategory = .promotion,
         mustKeep: Bool = false,
         isRealPerson: Bool = false,
-        confidence: Double = 0.9
+        confidence: Double = 0.9,
+        isUnsure: Bool = false
     ) -> SenderVerdict {
         SenderVerdict(
             senderEmail: sender,
@@ -60,7 +61,8 @@ final class AICategorizationEngineTests: XCTestCase {
             mustKeep: mustKeep,
             isRealPerson: isRealPerson,
             confidence: confidence,
-            reason: "mock reason"
+            reason: "mock reason",
+            isUnsure: isUnsure
         )
     }
 
@@ -167,7 +169,10 @@ final class AICategorizationEngineTests: XCTestCase {
             verdict: verdict("x@shop.com", category: .transactional, mustKeep: true)
         )
 
-        XCTAssertEqual(merged.safetyTier, .review, "the model may always argue for keeping")
+        XCTAssertEqual(
+            merged.safetyTier, .protected_,
+            "the model may always argue for keeping, and that argument is a decision"
+        )
     }
 
     func testVerdictNeverWeakensAProtectedContact() {
@@ -209,7 +214,9 @@ final class AICategorizationEngineTests: XCTestCase {
             verdict: verdict("orders@shop.com", category: .transactional, mustKeep: true)
         )
 
-        XCTAssertEqual(merged.safetyTier, .review)
+        // protected_, not review: a model decision to KEEP is a decision, and filing it
+        // under "needs review" is what made 131 decided emails look like pending work.
+        XCTAssertEqual(merged.safetyTier, .protected_)
         XCTAssertEqual(merged.category, .transactional)
     }
 
@@ -226,12 +233,17 @@ final class AICategorizationEngineTests: XCTestCase {
         )
 
         XCTAssertEqual(merged.category, .social, "a STRONG rule result keeps its category")
-        XCTAssertEqual(merged.safetyTier, .review, "but the model can still raise safety")
+        XCTAssertEqual(
+            merged.safetyTier, .protected_,
+            "the model can still raise safety, and a keep decision is settled not pending"
+        )
     }
 
     func testImpliedTierOrdering() {
         XCTAssertEqual(verdict("a", isRealPerson: true).impliedTier, .protected_)
-        XCTAssertEqual(verdict("a", mustKeep: true).impliedTier, .review)
+        // review is now reserved for the ABSENCE of a decision, which is abstention only.
+        XCTAssertEqual(verdict("a", mustKeep: true).impliedTier, .protected_)
+        XCTAssertEqual(verdict("a", isUnsure: true).impliedTier, .review)
         XCTAssertEqual(verdict("a").impliedTier, .safe)
     }
 
@@ -402,8 +414,14 @@ final class AICategorizationEngineTests: XCTestCase {
         var account = EmailAccount(email: "me@example.com", provider: .gmail, createdAt: Date())
         try await db.saveAccount(&account)
 
-        // 120 distinct unresolvable senders -> 3 batches at 50 per call.
-        let emails = (0..<120).map { email("m\($0)", sender: "s\($0)@unknownsite.org") }
+        // Derived from the constant rather than restating it: batchSize is a quality/cost
+        // tuning knob and was lowered from 50 to 10 to give each sender real attention, so a
+        // hardcoded expectation here only asserts that nobody has retuned it.
+        let senderCount = 120
+        let expectedBatches = Int(
+            (Double(senderCount) / Double(AICategorizationEngine.batchSize)).rounded(.up)
+        )
+        let emails = (0..<senderCount).map { email("m\($0)", sender: "s\($0)@unknownsite.org") }
         let transport = MockTransport()
         let engine = AICategorizationEngine(
             rules: RuleBasedEngine(), transport: transport, cache: db, accountId: account.id!
@@ -411,8 +429,12 @@ final class AICategorizationEngineTests: XCTestCase {
 
         _ = try await engine.categorize(emails: emails)
 
-        XCTAssertEqual(transport.callCount, 3)
-        XCTAssertEqual(transport.sendersAsked.count, 120)
+        XCTAssertEqual(transport.callCount, expectedBatches)
+        XCTAssertEqual(transport.sendersAsked.count, senderCount)
+        XCTAssertTrue(
+            transport.receivedBatches.allSatisfy { $0.count <= AICategorizationEngine.batchSize },
+            "no batch may exceed the configured size"
+        )
     }
 
     // MARK: - Prompt contract
@@ -488,7 +510,7 @@ final class AICategorizationEngineTests: XCTestCase {
         XCTAssertEqual(verdicts[0].category, .unknown)
         XCTAssertTrue(verdicts[0].mustKeep, "an unrecognised category must not be treated as disposable")
         XCTAssertLessThanOrEqual(verdicts[0].confidence, 0.3)
-        XCTAssertEqual(verdicts[0].impliedTier, .review)
+        XCTAssertEqual(verdicts[0].impliedTier, .protected_)
     }
 
     func testMalformedEntriesAreSkippedNotDefaulted() {
