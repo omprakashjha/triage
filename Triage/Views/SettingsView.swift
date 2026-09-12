@@ -27,8 +27,14 @@ struct SettingsView: View {
             .padding(24)
             .frame(maxWidth: 720, alignment: .leading)
         }
-        .task(id: appState.selectedAccount?.id) {
-            if let accountId = appState.selectedAccount?.id {
+        // Falls back to the first account, the same way scanTarget does. Gating this on an
+        // explicit sidebar selection meant Settings silently loaded NOTHING when no account
+        // was selected — so the corrections list showed "None yet" while 29 were stored, and
+        // the evaluation-set button, which only exists when the list is non-empty, could
+        // never appear. This is the second time this exact gating has hidden a working
+        // feature; the Scan button was the first.
+        .task(id: appState.settingsTarget?.id) {
+            if let accountId = appState.settingsTarget?.id {
                 await appState.loadSettings(accountId: accountId)
                 await appState.loadSenderRules(accountId: accountId)
                 await appState.loadCorrections(accountId: accountId)
@@ -206,8 +212,32 @@ struct SettingsView: View {
     /// a result they did not expect.
     private var correctionsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Your corrections")
-                .font(.headline)
+            // The action lives in the HEADER, not after the list. Placed below the rows it
+            // sat under 29 of them and was effectively invisible — a control the user has to
+            // scroll past the entire dataset to reach is one they will never find.
+            HStack(alignment: .firstTextBaseline) {
+                Text("Your corrections")
+                    .font(.headline)
+                if !appState.corrections.isEmpty {
+                    Text("\(appState.corrections.count)")
+                        .font(.caption)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 1)
+                        .background(Color.secondary.opacity(0.15), in: Capsule())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+                if !appState.corrections.isEmpty {
+                    Button("Add all to the evaluation set") {
+                        Task {
+                            guard let accountId = appState.settingsTarget?.id else { return }
+                            await appState.promoteCorrectionsToLabels(accountId: accountId)
+                        }
+                    }
+                    .font(.caption)
+                    .help("Turns your corrections into golden labels so accuracy can be measured.")
+                }
+            }
 
             Text("These override both the local rules and the cloud model, and are used as examples when judging senders you haven't corrected.")
                 .font(.caption)
@@ -219,49 +249,17 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.tertiary)
             } else {
-                ForEach(appState.corrections) { correction in
-                    HStack(alignment: .firstTextBaseline, spacing: 8) {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(correction.senderEmail)
-                                .font(.callout)
-                                .textSelection(.enabled)
-                            HStack(spacing: 6) {
-                                Text(correction.category.displayName)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                                if correction.mustKeep {
-                                    Text("never delete")
-                                        .font(.caption2)
-                                        .padding(.horizontal, 5)
-                                        .padding(.vertical, 1)
-                                        .background(Color.green.opacity(0.15), in: Capsule())
-                                        .foregroundStyle(.green)
-                                }
-                                if let pattern = correction.subjectPattern {
-                                    Text("subjects with “\(pattern)”")
-                                        .font(.caption2)
-                                        .foregroundStyle(.tertiary)
-                                }
-                            }
+                // Bounded and scrollable. Unbounded, 29 rows pushed every later section off
+                // the screen, which is how the maintenance controls below became unreachable
+                // too.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 2) {
+                        ForEach(appState.corrections) { correction in
+                            correctionRow(correction)
                         }
-                        Spacer()
-                        Button("Remove") {
-                            Task { await appState.removeCorrection(correction) }
-                        }
-                        .buttonStyle(.borderless)
-                        .font(.caption)
-                    }
-                    .padding(.vertical, 2)
-                }
-
-                Button("Add all to the evaluation set") {
-                    Task {
-                        guard let accountId = appState.selectedAccount?.id else { return }
-                        await appState.promoteCorrectionsToLabels(accountId: accountId)
                     }
                 }
-                .font(.caption)
-                .help("Turns your corrections into golden labels so accuracy can be measured.")
+                .frame(maxHeight: 220)
             }
 
             if let status = appState.correctionStatus {
@@ -274,7 +272,43 @@ struct SettingsView: View {
         }
     }
 
-    private var aiSection: some View {        VStack(alignment: .leading, spacing: 8) {
+    private func correctionRow(_ correction: UserCorrection) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(correction.senderEmail)
+                    .font(.callout)
+                    .textSelection(.enabled)
+                HStack(spacing: 6) {
+                    Text(correction.category.displayName)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if correction.mustKeep {
+                        Text("never delete")
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.green.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.green)
+                    }
+                    if let pattern = correction.subjectPattern {
+                        Text("subjects with “\(pattern)”")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            Spacer()
+            Button("Remove") {
+                Task { await appState.removeCorrection(correction) }
+            }
+            .buttonStyle(.borderless)
+            .font(.caption)
+        }
+        .padding(.vertical, 2)
+    }
+
+    private var aiSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Cloud categorization (optional)")
                 .font(.headline)
 

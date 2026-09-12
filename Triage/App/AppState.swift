@@ -93,6 +93,18 @@ final class AppState: ObservableObject {
         selectedAccount ?? accounts.first
     }
 
+    /// Which account the Settings screen reads and writes.
+    ///
+    /// Same fallback, for the same reason. Settings gated its whole data load on an explicit
+    /// sidebar selection, so with none it loaded nothing at all — the corrections list read
+    /// "None yet" while 29 were stored, and the button that turns them into evaluation labels
+    /// only renders when the list is non-empty, so it was unreachable. A screen the user
+    /// navigated to deliberately should act on the obvious account rather than wait to be
+    /// told which one.
+    var settingsTarget: EmailAccount? {
+        selectedAccount ?? accounts.first
+    }
+
     /// Scan whichever account is targeted, selecting it first so the UI agrees with what
     /// is being scanned.
     func scanSelectedAccount() async {
