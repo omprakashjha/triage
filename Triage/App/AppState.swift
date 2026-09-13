@@ -769,23 +769,45 @@ final class AppState: ObservableObject {
         )
     }
 
-    /// Decide one email and everything from the same sender with the same subject.
+    /// Decide one email and every recurring issue of the same mail from that sender.
     ///
-    /// The scope is the user's own choice and it is a better one than a per-message decision
-    /// would have been: it needs no new storage, because a correction scoped to the subject
-    /// already means exactly "this sender, this subject". Recurring mail — a monthly statement,
-    /// a repeated survey invitation, a re-sent notice — is decided once instead of once per copy.
+    /// The scope is the user's own choice and it needs no new storage: a correction scoped to a
+    /// subject already means "this sender, these subjects". Where it needed help was recurrence.
+    /// A real correction from this mailbox read
     ///
-    /// The CATEGORY is preserved deliberately. A swipe decides an email's fate, not its
-    /// classification, and overwriting the category would throw away the model's reading for no
-    /// reason.
+    ///     "daily activity statement for 08/27/2026"
+    ///
+    /// which matches exactly one email, so the same decision would come back every day forever.
+    /// The pattern is now the recurring STEM — `daily activity statement` — so one gesture covers
+    /// the family. See `SubjectStem` for what counts as varying.
+    ///
+    /// The CATEGORY is preserved deliberately. A drag decides an email's fate, not its
+    /// classification, and overwriting the category would discard the model's reading for nothing.
     func decideEmailAndItsRepeats(_ email: EmailMetadata, mustKeep: Bool) async {
+        let (pattern, didGeneralize) = SubjectStem.decisionPattern(for: email.subject)
+
+        // Measured BEFORE the write, so the number reported is the number the user can check
+        // against the list they were just looking at. Generalising widens what a single gesture
+        // covers, so it has to say by how much — an over-broad stem is then visible immediately
+        // and removable from Settings, rather than discovered later as missing mail.
+        let reach = try? await database.subjectPatternReach(
+            accountId: email.accountId,
+            senderEmail: email.senderEmail,
+            subjectPattern: pattern
+        )
+
         await correctCategory(
             for: email,
             to: email.category ?? .unknown,
             mustKeep: mustKeep,
-            scopeToSubjectPattern: email.subject
+            scopeToSubjectPattern: pattern
         )
+
+        if didGeneralize, let reach, reach.matching > 1 {
+            correctionStatus = "\(mustKeep ? "Keeping" : "Marked deletable") — "
+                + "\(reach.matching) of \(reach.total) emails from \(email.senderEmail) "
+                + "matching “\(pattern)”. Undo in Settings › Corrections."
+        }
     }
 
     // MARK: - Corrections
