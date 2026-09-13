@@ -22,34 +22,31 @@ public extension AppDatabase {
         subjectPattern: String
     ) async throws -> (matching: Int, total: Int) {
         let sender = senderEmail.lowercased()
-        let pattern = subjectPattern
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
 
-        return try await dbWriter.read { db in
-            let total = try Int.fetchOne(
+        // Counted in Swift rather than with SQL's INSTR, so it uses the SAME normalization as the
+        // matching that will actually decide the mail. An INSTR against the raw subject reported a
+        // reach the correction could not deliver — it would say "matches 12" and then move none of
+        // them, because a generated stem has had its punctuation replaced by spaces. A sender's
+        // mail is at most a few hundred rows, so the cost of being correct here is nil.
+        let subjects: [String] = try await dbWriter.read { db in
+            try String.fetchAll(
                 db,
                 sql: """
-                    SELECT COUNT(*) FROM emailMetadata
+                    SELECT subject FROM emailMetadata
                     WHERE accountId = ? AND LOWER(senderEmail) = ?
                     """,
                 arguments: [accountId, sender]
-            ) ?? 0
-
-            // An empty pattern means the whole sender, which is what a correction with no
-            // pattern does — reporting 0 there would misdescribe it.
-            guard !pattern.isEmpty else { return (total, total) }
-
-            let matching = try Int.fetchOne(
-                db,
-                sql: """
-                    SELECT COUNT(*) FROM emailMetadata
-                    WHERE accountId = ? AND LOWER(senderEmail) = ?
-                      AND INSTR(LOWER(subject), ?) > 0
-                    """,
-                arguments: [accountId, sender, pattern]
-            ) ?? 0
-            return (matching, total)
+            )
         }
+
+        let total = subjects.count
+        let pattern = subjectPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // An empty pattern means the whole sender, which is what a correction with no pattern
+        // does — reporting 0 there would misdescribe it.
+        guard !pattern.isEmpty else { return (total, total) }
+
+        let matching = subjects.filter { SubjectStem.pattern(pattern, matches: $0) }.count
+        return (matching, total)
     }
 }

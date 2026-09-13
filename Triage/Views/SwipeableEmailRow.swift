@@ -17,6 +17,13 @@ import TriageCore
 struct SwipeableEmailRow: View {
     let email: EmailMetadata
     let showsHoverActions: Bool
+    /// What was just applied to this row, shown inline when the row does not leave the list.
+    ///
+    /// A decision does not always move mail out of the tier being viewed: marking safe mail
+    /// deletable leaves it safe, and keeping protected mail leaves it protected. Those are correct
+    /// outcomes that used to be indistinguishable from the gesture having failed, which is the
+    /// single most confusing thing a destructive-adjacent control can do.
+    let confirmation: String?
     let onKeep: () -> Void
     let onDelete: () -> Void
     let onEdit: () -> Void
@@ -135,8 +142,22 @@ struct SwipeableEmailRow: View {
     private var content: some View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 2) {
-                Text(email.subject)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(email.subject)
+                        .lineLimit(1)
+                    // States the outcome on the row itself. The header status line reports the
+                    // same thing, but a row the user is looking at is where they expect the
+                    // answer.
+                    if let confirmation {
+                        Text(confirmation)
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.accentColor, in: Capsule())
+                            .foregroundStyle(.white)
+                            .transition(.scale.combined(with: .opacity))
+                    }
+                }
                 HStack(spacing: 6) {
                     Text(email.senderEmail)
                         .font(.caption)

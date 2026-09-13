@@ -22,6 +22,44 @@ import Foundation
 /// would match far more mail than the user was looking at.
 public enum SubjectStem {
 
+    /// The single normalization both generating and matching a pattern must use.
+    ///
+    /// This exists because they disagreed, and the consequences were invisible. A stem is built by
+    /// replacing punctuation with spaces, so
+    ///
+    ///     "Let op: Werkzaamheden Almere Centrum - Lelystad Centrum/Weesp/Naarden-Bussum"
+    ///
+    /// yields `let op werkzaamheden almere centrum lelystad centrum weesp naarden bussum`, which is
+    /// NOT a substring of the original — the colon, the dash and the slashes are gone. Matching was
+    /// a plain `subject.contains(pattern)` against the raw subject, so the pattern could not match
+    /// the very email it was derived from. The correction saved, the recategorization ran, and
+    /// nothing moved.
+    ///
+    /// It failed only for subjects with punctuation INSIDE the kept phrase, which is why it looked
+    /// intermittent rather than broken: mail like "Samen eropuit deze zomervakantie" worked and
+    /// anything with a colon or a hyphen silently did not.
+    ///
+    /// Applied to BOTH sides, so a hand-typed pattern keeps working whether or not the user types
+    /// the punctuation.
+    public static func normalizedForMatching(_ text: String) -> String {
+        let lowered = text.lowercased()
+        let despunctuated = lowered.replacingOccurrences(
+            of: #"[\p{P}\p{S}]+"#,
+            with: " ",
+            options: [.regularExpression]
+        )
+        return despunctuated
+            .split(whereSeparator: { $0 == " " || $0.isNewline || $0 == "\t" })
+            .joined(separator: " ")
+    }
+
+    /// Whether a stored pattern applies to a subject, under one consistent normalization.
+    public static func pattern(_ pattern: String, matches subject: String) -> Bool {
+        let normalizedPattern = normalizedForMatching(pattern)
+        guard !normalizedPattern.isEmpty else { return true }
+        return normalizedForMatching(subject).contains(normalizedPattern)
+    }
+
     /// Words that carry no identifying signal, so a stem consisting only of these is not a stem.
     /// Both languages, because this mailbox is Dutch and English.
     private static let stopwords: Set<String> = [

@@ -396,6 +396,8 @@ struct TierEmailListView: View {
     @State private var decidedMessageIds: Set<String> = []
     /// Guards against an older load applying its result after a newer one started.
     @State private var loadGeneration = 0
+    /// Per-row outcome text, for decisions that correctly leave the row where it is.
+    @State private var confirmations: [String: String] = [:]
 
     @EnvironmentObject private var appState: AppState
     let tier: SafetyTier
@@ -467,6 +469,7 @@ struct TierEmailListView: View {
                     SwipeableEmailRow(
                         email: email,
                         showsHoverActions: hoveredMessageId == email.messageId,
+                        confirmation: confirmations[email.messageId],
                         onKeep: { decide(email, mustKeep: true) },
                         onDelete: { decide(email, mustKeep: false) },
                         onEdit: { correctingEmail = email }
@@ -540,13 +543,30 @@ struct TierEmailListView: View {
         if decidedTier != tier {
             let doomed = emails.filter {
                 $0.senderEmail.lowercased() == sender
-                    && $0.subject.lowercased().contains(pattern)
+                    && SubjectStem.pattern(pattern, matches: $0.subject)
             }
             // Remembered, not just removed. A reload that was already in flight when this drag
             // happened would otherwise put these rows straight back.
             decidedMessageIds.formUnion(doomed.map(\.messageId))
             withAnimation(.easeOut(duration: 0.2)) {
                 emails.removeAll { decidedMessageIds.contains($0.messageId) }
+            }
+        } else {
+            // The decision is real but this tier already reflects it, so the rows stay. Say so on
+            // the rows themselves — silence here reads as a failed gesture, which is the worst
+            // possible reading for a control that decides whether mail gets deleted.
+            let staying = emails.filter {
+                $0.senderEmail.lowercased() == sender
+                    && SubjectStem.pattern(pattern, matches: $0.subject)
+            }
+            let label = mustKeep ? "Kept" : "Marked deletable"
+            withAnimation(.easeOut(duration: 0.15)) {
+                for m in staying { confirmations[m.messageId] = label }
+            }
+            let ids = staying.map(\.messageId)
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                withAnimation { for id in ids { confirmations.removeValue(forKey: id) } }
             }
         }
 
