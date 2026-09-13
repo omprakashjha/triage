@@ -513,11 +513,35 @@ struct TierEmailListView: View {
 
     /// Apply a decision to this email and every recurring issue of the same mail.
     private func decide(_ email: EmailMetadata, mustKeep: Bool) {
-        Task {
+        // The rows this decision covers are removed straight away, before any await.
+        //
+        // Waiting for the write and the reload to come back was the reason a decided row sat
+        // there: the data was correct within milliseconds — a test now pins that end to end — but
+        // the list is only refreshed by an async hop, and anything that delays or reorders that
+        // hop leaves the queue displaying mail that has already been decided. Removing locally
+        // makes the gesture's effect immediate and independent of that timing, and the reload
+        // below still reconciles against the database, so a failed write puts the rows back
+        // rather than hiding them.
+        let pattern = SubjectStem.decisionPattern(for: email.subject).pattern
+        let sender = email.senderEmail.lowercased()
+        let decidedTier: SafetyTier = mustKeep ? .protected_ : .safe
+
+        // Only when the decision actually moves mail OUT of the tier being displayed. Deciding
+        // safe mail to be deletable leaves it safe, and removing it there then restoring it on
+        // reload would be a flicker that misrepresents what happened.
+        if decidedTier != tier {
+            withAnimation(.easeOut(duration: 0.2)) {
+                emails.removeAll {
+                    $0.senderEmail.lowercased() == sender
+                        && $0.subject.lowercased().contains(pattern)
+                }
+            }
+        }
+
+        // @MainActor explicitly: this mutates view state, and a bare Task inherits whatever
+        // context the gesture handler happened to run on.
+        Task { @MainActor in
             await appState.decideEmailAndItsRepeats(email, mustKeep: mustKeep)
-            // Reload so the decided rows leave immediately, but WITHOUT the loading state: a
-            // decision refresh that swaps the whole list for a spinner makes the list flash on
-            // every drag, and working through a queue means doing this many times in a row.
             await loadEmails(showingProgress: false)
         }
     }
@@ -530,6 +554,7 @@ struct TierEmailListView: View {
         }
     }
 
+    @MainActor
     private func loadEmails(showingProgress: Bool = true) async {
         if showingProgress { isLoading = true }
         defer { if showingProgress { isLoading = false } }

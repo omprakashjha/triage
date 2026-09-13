@@ -863,6 +863,11 @@ final class AppState: ObservableObject {
             // Sender rows carry the tier counts a correction changes, so they would
             // otherwise show stale numbers until the next manual refresh.
             await loadSenderSummaries(accountId: accountId)
+            // And so do the breakdown's own category and tier counts. AccountStats is a snapshot
+            // computed at scan time and nothing here recomputed it, so every count on the left of
+            // the breakdown stayed at its pre-decision value — the tier a decision empties still
+            // claimed its old total.
+            accountStats = try await database.accountStats(accountId: accountId)
         } catch {
             correctionStatus = "Could not save the correction: \(error.localizedDescription)"
         }
