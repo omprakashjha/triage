@@ -126,6 +126,32 @@ final class DecideThenReloadTests: XCTestCase {
         try await decide(email: email, mustKeep: mustKeep, pattern: pattern)
     }
 
+    func testSeveralDecisionsOnOneSenderAllSurvive() async throws {
+        // Working quickly through one sender's mail means several corrections for that sender, and
+        // each decision recategorizes ALL of its mail. If a later pass did not see the earlier
+        // corrections it would revert them, which is the data-level half of the bug where only the
+        // first drag appeared to take effect. This pins that they accumulate.
+        let emails = [
+            reviewEmail("a", sender: "ib@example.com", subject: "Daily Activity Statement for 08/27/2026"),
+            reviewEmail("b", sender: "ib@example.com", subject: "Earnings Notification"),
+            reviewEmail("c", sender: "ib@example.com", subject: "Trade Confirmation 12345"),
+        ]
+        try await db.upsertEmails(emails)
+
+        // Three decisions in sequence, mixing keep and discard.
+        _ = try await decide(email: emails[0], mustKeep: false, pattern: "daily activity statement")
+        _ = try await decide(email: emails[1], mustKeep: false, pattern: "earnings notification")
+        let remaining = try await decide(email: emails[2], mustKeep: true, pattern: "trade confirmation")
+
+        XCTAssertTrue(remaining.isEmpty, "all three decisions must hold, not just the last")
+
+        let stored = try await db.emails(accountId: accountId, senderEmail: "ib@example.com")
+        let byId = Dictionary(uniqueKeysWithValues: stored.map { ($0.messageId, $0) })
+        XCTAssertEqual(byId["a"]?.safetyTier, .safe)
+        XCTAssertEqual(byId["b"]?.safetyTier, .safe, "the first decision was not reverted by later ones")
+        XCTAssertEqual(byId["c"]?.safetyTier, .protected_)
+    }
+
     func testTheTierIsActuallyPersistedNotJustComputed() async throws {
         // Guards the specific failure where the engine returns the right tier but the write does
         // not land, which would look identical from the UI.

@@ -392,6 +392,10 @@ struct TierEmailListView: View {
     /// Selection that nothing outside this screen needs has no business leaving it.
     @State private var selectedMessageId: String?
     @State private var hoveredMessageId: String?
+    /// Message ids decided on this screen, which no reload may bring back.
+    @State private var decidedMessageIds: Set<String> = []
+    /// Guards against an older load applying its result after a newer one started.
+    @State private var loadGeneration = 0
 
     @EnvironmentObject private var appState: AppState
     let tier: SafetyTier
@@ -497,6 +501,10 @@ struct TierEmailListView: View {
             .allowsHitTesting(false)
         }
         .task(id: tier) {
+            // A tier switch is a fresh piece of work, so decisions from the previous one stop
+            // suppressing rows here — otherwise a decision reversed in Settings could never
+            // reappear without relaunching.
+            decidedMessageIds = []
             await loadEmails()
         }
         .sheet(item: $correctingEmail) { email in
@@ -530,11 +538,15 @@ struct TierEmailListView: View {
         // safe mail to be deletable leaves it safe, and removing it there then restoring it on
         // reload would be a flicker that misrepresents what happened.
         if decidedTier != tier {
+            let doomed = emails.filter {
+                $0.senderEmail.lowercased() == sender
+                    && $0.subject.lowercased().contains(pattern)
+            }
+            // Remembered, not just removed. A reload that was already in flight when this drag
+            // happened would otherwise put these rows straight back.
+            decidedMessageIds.formUnion(doomed.map(\.messageId))
             withAnimation(.easeOut(duration: 0.2)) {
-                emails.removeAll {
-                    $0.senderEmail.lowercased() == sender
-                        && $0.subject.lowercased().contains(pattern)
-                }
+                emails.removeAll { decidedMessageIds.contains($0.messageId) }
             }
         }
 
@@ -559,14 +571,28 @@ struct TierEmailListView: View {
         if showingProgress { isLoading = true }
         defer { if showingProgress { isLoading = false } }
         guard let account = appState.selectedAccount, let accountId = account.id else { return }
+
+        // Each load claims a generation. An older load that finishes after a newer one started is
+        // discarded rather than applied: without this, the reload from drag 1 lands after drag 2
+        // has already removed its rows and overwrites the list with database contents that still
+        // contain them, because drag 2's write has not committed yet. That is precisely why the
+        // first drag appeared to work and the ones after it did not.
+        loadGeneration += 1
+        let generation = loadGeneration
+
         do {
             // The review tier is a work queue, so order it weakest-confidence first.
             // Other tiers are reference lists and stay newest-first.
+            let fetched: [EmailMetadata]
             if tier == .review {
-                emails = try await appState.fetchEmailsForReview(accountId: accountId)
+                fetched = try await appState.fetchEmailsForReview(accountId: accountId)
             } else {
-                emails = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
+                fetched = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
             }
+            guard generation == loadGeneration else { return }
+            // Anything decided on this screen stays gone even if a write is still in flight, so a
+            // row can never flicker back after the user has already dealt with it.
+            emails = fetched.filter { !decidedMessageIds.contains($0.messageId) }
         } catch {
             print("Failed to load emails by tier: \(error)")
         }
