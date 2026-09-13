@@ -21,6 +21,35 @@ struct CorrectionSheet: View {
     @State private var scope: Scope = .wholeSender
     @State private var subjectPattern: String = ""
     @State private var isSaving = false
+    /// How many of this sender's emails the current pattern matches, out of how many exist.
+    @State private var reach: (matching: Int, total: Int)?
+
+    private var reachDescription: String {
+        guard subjectPattern.trimmingCharacters(in: .whitespacesAndNewlines).count >= 3 else {
+            return "Type at least 3 characters."
+        }
+        guard let reach else { return "Checking how many emails this matches…" }
+        if reach.matching == 0 {
+            return "Matches none of this sender's \(reach.total) emails — check the spelling."
+        }
+        if reach.matching == 1 {
+            return "Matches 1 of \(reach.total) — just this email. Delete words to cover more."
+        }
+        return "Matches \(reach.matching) of this sender's \(reach.total) emails."
+    }
+
+    private func updateReach() async {
+        let pattern = subjectPattern.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pattern.count >= 3 else {
+            reach = nil
+            return
+        }
+        reach = await appState.subjectPatternReach(
+            senderEmail: email.senderEmail,
+            subjectPattern: pattern,
+            accountId: email.accountId
+        )
+    }
 
     /// How wide the correction should reach.
     private enum Scope: String, CaseIterable, Identifiable {
@@ -43,6 +72,19 @@ struct CorrectionSheet: View {
         // keep/discard decision does not have to re-pick a category that was already right.
         _category = State(initialValue: email.category ?? .unknown)
         _mustKeep = State(initialValue: email.safetyTier != .safe)
+
+        // Prefilled with THIS email's subject, and scoped to matching subjects by default.
+        //
+        // Opening this sheet from a row means "act on this email", and the previous default
+        // made that the long way round: pick the scope, then retype what was already on screen.
+        // Prefilling a field that is hidden until you switch scope would be pointless, so the
+        // scope moves with it.
+        //
+        // The full subject is a deliberately NARROW starting point — it matches this email and
+        // its exact repeats, which is what acting on one email means. Widening is a matter of
+        // deleting words, and the reach line below reports what each deletion buys.
+        _subjectPattern = State(initialValue: email.subject)
+        _scope = State(initialValue: .matchingSubjects)
     }
 
     var body: some View {
@@ -147,6 +189,21 @@ struct CorrectionSheet: View {
             if scope == .matchingSubjects {
                 TextField("e.g. jaarafrekening", text: $subjectPattern)
                     .textFieldStyle(.roundedBorder)
+
+                // Live reach, because a pattern is a rule for mail that has not arrived yet and
+                // whether it generalises is invisible while typing. The full subject matches one
+                // email; deleting words until this number climbs is how a rule gets made, and
+                // seeing it climb is what teaches that.
+                Text(reachDescription)
+                    .font(.caption)
+                    .foregroundStyle(reach.map { $0.matching > 1 } == true ? .green : .secondary)
+                    .task(id: subjectPattern) {
+                        // Debounced: this runs on every keystroke.
+                        try? await Task.sleep(for: .milliseconds(200))
+                        guard !Task.isCancelled else { return }
+                        await updateReach()
+                    }
+
                 Text(
                     "Use this when a sender mixes mail you want with mail you don't — "
                         + "a rail operator sending both offers and tickets, for example."

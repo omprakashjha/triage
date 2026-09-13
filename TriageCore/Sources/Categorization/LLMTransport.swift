@@ -336,7 +336,7 @@ public enum SenderClassificationPrompt {
 
         Bad, because each matches exactly one message:
           disposableSubjects: ["zomer in eigen land met ns dagje uit-magazine"]
-          keepSubjects: ["let op: werkzaamheden almere centrum - weesp"]
+          keepSubjects: ["let op: werkzaamheden noordstad centrum - westdorp"]
 
         Prefer the shortest fragment that does not also match the other group. If you \
         cannot find fragments that generalise, leave BOTH lists empty and give the sender \
@@ -490,7 +490,7 @@ public enum SenderClassificationPrompt {
             // lines back — "zomer in eigen land met ns dagje uit-magazine" — each matching
             // exactly the one message it came from. On a real mailbox that left 59 emails
             // matching no pattern at all. The word cap separates the two cases cleanly: the
-            // fragments that worked ("daily activity statement", "korting") are one to three
+            // fragments that worked ("daily account statement", "korting") are one to three
             // words, and a copied subject line is invariably longer.
             func fragments(_ key: String) -> [String] {
                 (entry[key]?.arrayValue ?? [])

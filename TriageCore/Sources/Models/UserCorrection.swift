@@ -89,7 +89,7 @@ public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Senda
     /// separately.
     ///
     /// This previously fell back to `category.isTypicallyDisposable`, so a user who
-    /// categorised their broker's daily activity statements as `notification` and
+    /// categorised their broker's daily account statements as `notification` and
     /// explicitly unticked "never delete this automatically" got `.review` anyway — because
     /// notifications are not "typically" disposable. That is an instruction being overruled
     /// by a heuristic, which is the failure mode this whole type exists to end. 27 emails
@@ -107,7 +107,10 @@ public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Senda
     public func matches(senderEmail: String, subject: String) -> Bool {
         guard self.senderEmail == senderEmail.lowercased() else { return false }
         guard let subjectPattern else { return true }
-        return subject.lowercased().contains(subjectPattern)
+        // Normalized on both sides, because a generated stem has had its punctuation replaced by
+        // spaces and so is not a substring of the raw subject it came from. A raw `contains` here
+        // meant a correction could silently fail to match its own email.
+        return SubjectStem.pattern(subjectPattern, matches: subject)
     }
 
     /// How specific this correction is, so the narrowest matching one wins.

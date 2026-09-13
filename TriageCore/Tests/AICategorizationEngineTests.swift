@@ -126,14 +126,14 @@ final class AICategorizationEngineTests: XCTestCase {
     func testProviderDisagreementKeepsProvisionalMailInReview() {
         // Same verdict, but the provider filed this message under Updates — where bills
         // live. The disagreement is decided per MESSAGE, which is how a mixed sender like
-        // info@email.ns.nl (46 promotional, 58 receipts) gets split correctly.
+        // info@email.spoorwegen.example (46 promotional, 58 receipts) gets split correctly.
         let ruleResult = CategorizationResult(
             messageId: "m", category: .unknown, safetyTier: .review,
             confidence: 0.4, reason: "No matching rule"
         )
         let merged = AICategorizationEngine.merge(
             rule: ruleResult,
-            verdict: verdict("info@email.ns.nl", category: .promotion, mustKeep: false),
+            verdict: verdict("info@email.spoorwegen.example", category: .promotion, mustKeep: false),
             providerCategory: .updates
         )
 

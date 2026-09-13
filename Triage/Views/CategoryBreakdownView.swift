@@ -6,22 +6,40 @@ struct CategoryBreakdownView: View {
     @EnvironmentObject private var appState: AppState
     let stats: AccountStats
 
-    @State private var selectedCategory: EmailCategory?
-    @State private var selectedTier: SafetyTier?
+    /// What the left list has selected — a category OR a tier, never both and never neither
+    /// tracked separately.
+    ///
+    /// Two optionals plus an `.onTapGesture` is what this was, and it is the same defect shape as
+    /// the sidebar: the tier rows wrote BOTH `selectedCategory = nil` and `selectedTier = …` from
+    /// a tap gesture living inside a selection-bound List, so one click drove the List's own
+    /// selection machinery and two state writes at once. HSplitView then rebuilt both panes and
+    /// collapsed the left one. Category rows used the native `.tag` path and were unaffected,
+    /// which is exactly the asymmetry the user reported.
+    ///
+    /// One value, set only through the List's selection binding, means one mechanism and a right
+    /// pane that is a pure function of it.
+    private enum Selection: Hashable {
+        case category(EmailCategory)
+        case tier(SafetyTier)
+    }
+
+    @State private var selection: Selection?
 
     var body: some View {
         HSplitView {
-            // Left: Category list
             categoryList
                 .frame(minWidth: 250, maxWidth: 350)
 
-            // Right: Email list for selected category or tier
-            if let category = selectedCategory {
+            // A minimum width on the detail side too. HSplitView distributes space when its
+            // children change, and a detail view with no floor can take the whole width.
+            switch selection {
+            case .category(let category):
                 EmailListView(category: category)
-                    .onChange(of: selectedCategory) { _, _ in selectedTier = nil }
-            } else if let tier = selectedTier {
+                    .frame(minWidth: 420)
+            case .tier(let tier):
                 TierEmailListView(tier: tier)
-            } else {
+                    .frame(minWidth: 420)
+            case nil:
                 VStack {
                     Image(systemName: "envelope.open")
                         .font(.system(size: 48))
@@ -29,7 +47,7 @@ struct CategoryBreakdownView: View {
                     Text("Select a category to view emails")
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -77,7 +95,7 @@ struct CategoryBreakdownView: View {
             Divider()
 
             // Categories
-            List(selection: $selectedCategory) {
+            List(selection: $selection) {
                 Section("Categories") {
                     ForEach(sortedCategories, id: \.category) { item in
                         CategoryRow(
@@ -85,17 +103,20 @@ struct CategoryBreakdownView: View {
                             count: item.count,
                             percentage: Double(item.count) / Double(max(stats.totalEmails, 1))
                         )
-                        .tag(item.category)
+                        .tag(Selection.category(item.category))
                     }
                 }
 
                 Section("Safety Tiers") {
+                    // Tagged, exactly like the category rows. These previously used
+                    // `.onTapGesture` to write two separate selections, which competed with the
+                    // List's own selection handling and collapsed the split view's left pane.
                     TierRow(tier: .safe, count: stats.tierBreakdown[.safe] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .safe }
+                        .tag(Selection.tier(.safe))
                     TierRow(tier: .review, count: stats.tierBreakdown[.review] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .review }
+                        .tag(Selection.tier(.review))
                     TierRow(tier: .protected_, count: stats.tierBreakdown[.protected_] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .protected_ }
+                        .tag(Selection.tier(.protected_))
                 }
 
                 if stats.uncategorizedEmails > 0 {
@@ -364,6 +385,19 @@ struct EmailListView: View {
 struct TierEmailListView: View {
     /// The email whose categorization the user is fixing, if any.
     @State private var correctingEmail: EmailMetadata?
+    /// Local @State, deliberately not a @Published on AppState.
+    ///
+    /// A List whose selection binding writes shared observable state, in a view that also
+    /// mutates other observable state on the same tap, is what emptied the sidebar last night.
+    /// Selection that nothing outside this screen needs has no business leaving it.
+    @State private var selectedMessageId: String?
+    @State private var hoveredMessageId: String?
+    /// Message ids decided on this screen, which no reload may bring back.
+    @State private var decidedMessageIds: Set<String> = []
+    /// Guards against an older load applying its result after a newer one started.
+    @State private var loadGeneration = 0
+    /// Per-row outcome text, for decisions that correctly leave the row where it is.
+    @State private var confirmations: [String: String] = [:]
 
     @EnvironmentObject private var appState: AppState
     let tier: SafetyTier
@@ -374,15 +408,37 @@ struct TierEmailListView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
-                Circle()
-                    .fill(tierColor)
-                    .frame(width: 10, height: 10)
-                Text(tier.displayName)
-                    .font(.headline)
-                Text("(\(emails.count) emails)")
-                    .foregroundStyle(.secondary)
-                Spacer()
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Circle()
+                        .fill(tierColor)
+                        .frame(width: 10, height: 10)
+                    Text(tier.displayName)
+                        .font(.headline)
+                    Text("(\(emails.count) emails)")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                // Stated, because a gesture nobody knows about is not a feature. The keyboard
+                // path is the fast one once known, so it is named here too.
+                if !emails.isEmpty {
+                    Text("Drag a row right to keep, left to mark it deletable — or select one and press K or D. Either applies to every email from the same sender with the same subject.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // The outcome of a decision, shown HERE. It was already being recorded on
+                // AppState and displayed on three other screens but not on the one where the
+                // decisions are now made — so a swipe that succeeded and a swipe that silently
+                // failed looked identical, which is precisely the ambiguity that makes a UI
+                // impossible to trust.
+                if let status = appState.correctionStatus {
+                    Label(status, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding()
 
@@ -396,73 +452,134 @@ struct TierEmailListView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(emails) {
-                    TableColumn("Sender") { email in
-                        VStack(alignment: .leading) {
-                            Text(email.sender)
-                                .fontWeight(.medium)
-                            Text(email.senderEmail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                // A List rather than a Table, because the row needs to move under a gesture and
+                // a Table row cannot.
+                //
+                // The gesture is implemented here rather than with `.swipeActions`, which did
+                // nothing on this machine. That modifier is documented as available on macOS but
+                // it listens for a two-finger trackpad swipe, which is a SCROLL event — on a
+                // mouse, or a trackpad the system reports differently, there is no gesture for it
+                // to hear and it silently never fires. A DragGesture responds to press-and-drag,
+                // which every pointing device produces.
+                //
+                // Doing it by hand also buys the thing the modifier could not: the row follows
+                // the pointer and names the action it is about to take, so the gesture is
+                // discovered by trying it rather than by being told.
+                List(emails, id: \.messageId, selection: $selectedMessageId) { email in
+                    SwipeableEmailRow(
+                        email: email,
+                        showsHoverActions: hoveredMessageId == email.messageId,
+                        confirmation: confirmations[email.messageId],
+                        onKeep: { decide(email, mustKeep: true) },
+                        onDelete: { decide(email, mustKeep: false) },
+                        onEdit: { correctingEmail = email }
+                    )
+                    .onHover { hoveredMessageId = $0 ? email.messageId : nil }
+                    .contextMenu {
+                        Button("Safe to delete — this and its repeats") {
+                            decide(email, mustKeep: false)
                         }
-                        .contextMenu {
-                            Button("Correct this categorization…") { correctingEmail = email }
+                        Button("Keep — this and its repeats") {
+                            decide(email, mustKeep: true)
                         }
+                        Divider()
+                        Button("Correct this categorization…") { correctingEmail = email }
                     }
-                    .width(min: 150, ideal: 200)
-
-                    TableColumn("Subject") { email in
-                        Text(email.subject)
-                            .lineLimit(1)
-                    }
-                    .width(min: 200, ideal: 300)
-
-                    TableColumn("") { email in
-                        Button {
-                            correctingEmail = email
-                        } label: {
-                            Image(systemName: "pencil.line")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Correct this categorization")
-                    }
-                    .width(28)
-
-                    TableColumn("Category") { email in
-                        if let category = email.category {
-                            Text(category.displayName)
-                                .font(.caption)
-                        }
-                    }
-                    .width(80)
-
-                    TableColumn("Date") { email in
-                        Text(email.date, style: .date)
-                            .font(.caption)
-                    }
-                    .width(80)
-
-                    TableColumn("Why") { email in
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(email.categoryReason ?? "—")
-                                .font(.caption2)
-                                .lineLimit(2)
-                                .foregroundStyle(.secondary)
-                            if let confidence = email.categoryConfidence {
-                                ConfidenceBadge(confidence: confidence)
-                            }
-                        }
-                    }
-                    .width(min: 140, ideal: 220)
                 }
+                .listStyle(.inset)
             }
         }
+        // Keyboard shortcuts on hidden buttons, which is how a List row action gets a shortcut:
+        // they act on the selected row, so D and K work once a row is selected with the arrows.
+        .background {
+            VStack {
+                Button("") { withSelected { decide($0, mustKeep: false) } }
+                    .keyboardShortcut("d", modifiers: [])
+                Button("") { withSelected { decide($0, mustKeep: true) } }
+                    .keyboardShortcut("k", modifiers: [])
+                Button("") { withSelected { correctingEmail = $0 } }
+                    .keyboardShortcut(.return, modifiers: [])
+            }
+            .opacity(0)
+            .allowsHitTesting(false)
+        }
         .task(id: tier) {
+            // A tier switch is a fresh piece of work, so decisions from the previous one stop
+            // suppressing rows here — otherwise a decision reversed in Settings could never
+            // reappear without relaunching.
+            decidedMessageIds = []
             await loadEmails()
         }
         .sheet(item: $correctingEmail) { email in
             CorrectionSheet(email: email)
                 .environmentObject(appState)
+        }
+    }
+
+    private func withSelected(_ action: (EmailMetadata) -> Void) {
+        guard let id = selectedMessageId,
+              let email = emails.first(where: { $0.messageId == id }) else { return }
+        action(email)
+    }
+
+    /// Apply a decision to this email and every recurring issue of the same mail.
+    private func decide(_ email: EmailMetadata, mustKeep: Bool) {
+        // The rows this decision covers are removed straight away, before any await.
+        //
+        // Waiting for the write and the reload to come back was the reason a decided row sat
+        // there: the data was correct within milliseconds — a test now pins that end to end — but
+        // the list is only refreshed by an async hop, and anything that delays or reorders that
+        // hop leaves the queue displaying mail that has already been decided. Removing locally
+        // makes the gesture's effect immediate and independent of that timing, and the reload
+        // below still reconciles against the database, so a failed write puts the rows back
+        // rather than hiding them.
+        let pattern = SubjectStem.decisionPattern(for: email.subject).pattern
+        let sender = email.senderEmail.lowercased()
+        let decidedTier: SafetyTier = mustKeep ? .protected_ : .safe
+
+        // Only when the decision actually moves mail OUT of the tier being displayed. Deciding
+        // safe mail to be deletable leaves it safe, and removing it there then restoring it on
+        // reload would be a flicker that misrepresents what happened.
+        if decidedTier != tier {
+            let doomed = emails.filter {
+                $0.senderEmail.lowercased() == sender
+                    && SubjectStem.pattern(pattern, matches: $0.subject)
+            }
+            // Remembered, not just removed. A reload that was already in flight when this drag
+            // happened would otherwise put these rows straight back.
+            decidedMessageIds.formUnion(doomed.map(\.messageId))
+            // The counts move with the rows, in the same frame. They are recomputed properly when
+            // the write lands, but that write queues behind any decision already in flight and
+            // recategorizes the sender's whole mail through the engine, so waiting for it made the
+            // sidebar look like it had ignored the gesture.
+            appState.applyOptimisticTierShift(from: tier, to: decidedTier, count: doomed.count)
+            withAnimation(.easeOut(duration: 0.2)) {
+                emails.removeAll { decidedMessageIds.contains($0.messageId) }
+            }
+        } else {
+            // The decision is real but this tier already reflects it, so the rows stay. Say so on
+            // the rows themselves — silence here reads as a failed gesture, which is the worst
+            // possible reading for a control that decides whether mail gets deleted.
+            let staying = emails.filter {
+                $0.senderEmail.lowercased() == sender
+                    && SubjectStem.pattern(pattern, matches: $0.subject)
+            }
+            let label = mustKeep ? "Kept" : "Marked deletable"
+            withAnimation(.easeOut(duration: 0.15)) {
+                for m in staying { confirmations[m.messageId] = label }
+            }
+            let ids = staying.map(\.messageId)
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(3))
+                withAnimation { for id in ids { confirmations.removeValue(forKey: id) } }
+            }
+        }
+
+        // @MainActor explicitly: this mutates view state, and a bare Task inherits whatever
+        // context the gesture handler happened to run on.
+        Task { @MainActor in
+            await appState.decideEmailAndItsRepeats(email, mustKeep: mustKeep)
+            await loadEmails(showingProgress: false)
         }
     }
 
@@ -474,18 +591,33 @@ struct TierEmailListView: View {
         }
     }
 
-    private func loadEmails() async {
-        isLoading = true
-        defer { isLoading = false }
+    @MainActor
+    private func loadEmails(showingProgress: Bool = true) async {
+        if showingProgress { isLoading = true }
+        defer { if showingProgress { isLoading = false } }
         guard let account = appState.selectedAccount, let accountId = account.id else { return }
+
+        // Each load claims a generation. An older load that finishes after a newer one started is
+        // discarded rather than applied: without this, the reload from drag 1 lands after drag 2
+        // has already removed its rows and overwrites the list with database contents that still
+        // contain them, because drag 2's write has not committed yet. That is precisely why the
+        // first drag appeared to work and the ones after it did not.
+        loadGeneration += 1
+        let generation = loadGeneration
+
         do {
             // The review tier is a work queue, so order it weakest-confidence first.
             // Other tiers are reference lists and stay newest-first.
+            let fetched: [EmailMetadata]
             if tier == .review {
-                emails = try await appState.fetchEmailsForReview(accountId: accountId)
+                fetched = try await appState.fetchEmailsForReview(accountId: accountId)
             } else {
-                emails = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
+                fetched = try await appState.fetchEmailsByTier(accountId: accountId, tier: tier)
             }
+            guard generation == loadGeneration else { return }
+            // Anything decided on this screen stays gone even if a write is still in flight, so a
+            // row can never flicker back after the user has already dealt with it.
+            emails = fetched.filter { !decidedMessageIds.contains($0.messageId) }
         } catch {
             print("Failed to load emails by tier: \(error)")
         }

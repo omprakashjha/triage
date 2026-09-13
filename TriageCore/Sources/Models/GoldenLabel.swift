@@ -62,7 +62,10 @@ public struct GoldenLabel: Identifiable, Codable, FetchableRecord, PersistableRe
     public func matches(senderEmail: String, subject: String) -> Bool {
         guard self.senderEmail == senderEmail.lowercased() else { return false }
         guard let subjectPattern else { return true }
-        return subject.lowercased().contains(subjectPattern)
+        // Same normalization as UserCorrection, and for the same reason: labels are promoted FROM
+        // corrections, so a label carrying a generated stem must match the mail its correction
+        // matched. Leaving these two disagreeing would silently understate measured accuracy.
+        return SubjectStem.pattern(subjectPattern, matches: subject)
     }
 
     /// How specific this label is, so the narrowest matching one is scored against.

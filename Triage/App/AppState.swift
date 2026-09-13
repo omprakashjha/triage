@@ -756,6 +756,89 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// How many of a sender's emails a subject pattern matches, for live scope feedback.
+    func subjectPatternReach(
+        senderEmail: String,
+        subjectPattern: String,
+        accountId: Int64
+    ) async -> (matching: Int, total: Int)? {
+        try? await database.subjectPatternReach(
+            accountId: accountId,
+            senderEmail: senderEmail,
+            subjectPattern: subjectPattern
+        )
+    }
+
+    /// Reflect a decision in the displayed tier counts before its write completes.
+    ///
+    /// Only the rows the caller could see are counted, so this can understate a decision that also
+    /// covers mail sitting in another tier. That is acceptable: the authoritative recount runs when
+    /// the write finishes and corrects any drift. What it buys is that the counts and the list stop
+    /// disagreeing with each other in the moment after a gesture.
+    func applyOptimisticTierShift(from: SafetyTier, to: SafetyTier, count: Int) {
+        guard let stats = accountStats else { return }
+        accountStats = stats.movingTier(from: from, to: to, count: count)
+    }
+
+    /// Serializes decision work so rapid drags cannot undo each other.
+    ///
+    /// Each decision saves a correction and then recategorizes the whole sender by reading its
+    /// mail, running the engine and writing the results back. Two of those running concurrently on
+    /// the same sender — which is exactly what working quickly through one sender's mail produces —
+    /// can have the second read the corrections before the first has saved its own, so its write
+    /// reverts the first decision. Chaining them costs nothing the user can perceive, because the
+    /// list has already updated optimistically by the time this runs.
+    private var decisionChain: Task<Void, Never>?
+
+    /// Decide one email and every recurring issue of the same mail from that sender.
+    ///
+    /// The scope is the user's own choice and it needs no new storage: a correction scoped to a
+    /// subject already means "this sender, these subjects". A real correction from this mailbox
+    /// read "daily account statement for 08/27/2026", which matches exactly one email, so the
+    /// same decision would come back every day forever. The pattern is now the recurring STEM, so
+    /// one gesture covers the family. See `SubjectStem`.
+    ///
+    /// The CATEGORY is preserved deliberately. A drag decides an email's fate, not its
+    /// classification, and overwriting the category would discard the model's reading for nothing.
+    @discardableResult
+    func decideEmailAndItsRepeats(_ email: EmailMetadata, mustKeep: Bool) async -> String {
+        let (pattern, didGeneralize) = SubjectStem.decisionPattern(for: email.subject)
+
+        let previous = decisionChain
+        let task = Task { @MainActor in
+            // Wait for any decision already in flight, so the corrections this one reads include
+            // every earlier one.
+            await previous?.value
+
+            // Measured BEFORE the write, so the number reported is the number the user can check
+            // against the list they were just looking at. Generalising widens what a single
+            // gesture covers, so it has to say by how much — an over-broad stem is then visible
+            // immediately and removable from Settings, rather than discovered later as missing
+            // mail.
+            let reach = try? await database.subjectPatternReach(
+                accountId: email.accountId,
+                senderEmail: email.senderEmail,
+                subjectPattern: pattern
+            )
+
+            await correctCategory(
+                for: email,
+                to: email.category ?? .unknown,
+                mustKeep: mustKeep,
+                scopeToSubjectPattern: pattern
+            )
+
+            if didGeneralize, let reach, reach.matching > 1 {
+                correctionStatus = "\(mustKeep ? "Keeping" : "Marked deletable") — "
+                    + "\(reach.matching) of \(reach.total) emails from \(email.senderEmail) "
+                    + "matching “\(pattern)”. Undo in Settings › Corrections."
+            }
+        }
+        decisionChain = task
+        await task.value
+        return pattern
+    }
+
     // MARK: - Corrections
 
     func loadCorrections(accountId: Int64) async {
@@ -809,6 +892,11 @@ final class AppState: ObservableObject {
             // Sender rows carry the tier counts a correction changes, so they would
             // otherwise show stale numbers until the next manual refresh.
             await loadSenderSummaries(accountId: accountId)
+            // And so do the breakdown's own category and tier counts. AccountStats is a snapshot
+            // computed at scan time and nothing here recomputed it, so every count on the left of
+            // the breakdown stayed at its pre-decision value — the tier a decision empties still
+            // claimed its old total.
+            accountStats = try await database.accountStats(accountId: accountId)
         } catch {
             correctionStatus = "Could not save the correction: \(error.localizedDescription)"
         }

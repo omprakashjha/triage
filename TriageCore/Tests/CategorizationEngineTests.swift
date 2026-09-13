@@ -69,14 +69,14 @@ final class RuleBasedEngineTests: XCTestCase {
     }
 
     func testDutchUtilityBillIsNotTreatedAsDisposableNewsletter() async throws {
-        // Real regression: "Jaarafrekening van waterbedrijf Vitens" (an annual water
-        // bill) from noreply@mail.vitens.nl was classified newsletter/.safe at 0.85.
+        // Real regression: "Jaarafrekening van waterbedrijf Aquanet" (an annual water
+        // bill) from noreply@mail.waterbedrijf.example was classified newsletter/.safe at 0.85.
         // Every English subject pattern misses it, the sender is unlisted, and the
         // `mail.` subdomain is only a generic transport signal — so the unsubscribe
         // fallback decided it, confidently and wrongly.
         let email = makeEmail(
-            senderEmail: "noreply@mail.vitens.nl",
-            subject: "Jaarafrekening van waterbedrijf Vitens",
+            senderEmail: "noreply@mail.waterbedrijf.example",
+            subject: "Jaarafrekening van waterbedrijf Aquanet",
             hasListUnsubscribe: true
         )
         let results = try await engine.categorize(emails: [email])
@@ -183,9 +183,9 @@ final class RuleBasedEngineTests: XCTestCase {
         let results = try await engine.categorize(emails: [email])
 
         XCTAssertEqual(results[0].category, .notification)
-        // NOT .safe any more, and this is the Vitens lesson generalised: `noreply@`
+        // NOT .safe any more, and this is the water-bill lesson generalised: `noreply@`
         // proves nobody reads replies, not that the content is disposable. The water
-        // bill that started this was noreply@mail.vitens.nl.
+        // bill that started this was noreply@mail.waterbedrijf.example.
         XCTAssertEqual(results[0].safetyTier, .review)
         XCTAssertEqual(results[0].evidence, .weak)
     }
