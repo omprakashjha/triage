@@ -1435,6 +1435,30 @@ public struct AccountStats: Sendable {
     public var safeToAction: Int { tierBreakdown[.safe] ?? 0 }
     public var needsReview: Int { tierBreakdown[.review] ?? 0 }
     public var protected_: Int { tierBreakdown[.protected_] ?? 0 }
+
+    /// The same stats with `count` emails moved between tiers.
+    ///
+    /// Exists so a decision can be reflected in the displayed counts at once. The authoritative
+    /// numbers come from a recount after the write, but that write is serialized behind any other
+    /// decision in flight and recategorizes the sender's entire mail through the engine — which for
+    /// a sender with a hundred messages is long enough that counts appearing to ignore the gesture
+    /// is the natural reading. The list is already updated optimistically; leaving the counts behind
+    /// made the two disagree, which is worse than either being slow.
+    ///
+    /// Clamped at zero, so a miscount can never render a negative total.
+    public func movingTier(from: SafetyTier, to: SafetyTier, count: Int) -> AccountStats {
+        guard count > 0, from != to else { return self }
+        var tiers = tierBreakdown
+        tiers[from] = max(0, (tiers[from] ?? 0) - count)
+        tiers[to] = (tiers[to] ?? 0) + count
+        return AccountStats(
+            totalEmails: totalEmails,
+            unreadEmails: unreadEmails,
+            uncategorizedEmails: uncategorizedEmails,
+            categoryBreakdown: categoryBreakdown,
+            tierBreakdown: tiers
+        )
+    }
 }
 
 // MARK: - Action Log Operations

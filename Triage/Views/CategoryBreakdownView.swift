@@ -548,6 +548,11 @@ struct TierEmailListView: View {
             // Remembered, not just removed. A reload that was already in flight when this drag
             // happened would otherwise put these rows straight back.
             decidedMessageIds.formUnion(doomed.map(\.messageId))
+            // The counts move with the rows, in the same frame. They are recomputed properly when
+            // the write lands, but that write queues behind any decision already in flight and
+            // recategorizes the sender's whole mail through the engine, so waiting for it made the
+            // sidebar look like it had ignored the gesture.
+            appState.applyOptimisticTierShift(from: tier, to: decidedTier, count: doomed.count)
             withAnimation(.easeOut(duration: 0.2)) {
                 emails.removeAll { decidedMessageIds.contains($0.messageId) }
             }

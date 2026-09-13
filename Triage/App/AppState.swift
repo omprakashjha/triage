@@ -769,6 +769,17 @@ final class AppState: ObservableObject {
         )
     }
 
+    /// Reflect a decision in the displayed tier counts before its write completes.
+    ///
+    /// Only the rows the caller could see are counted, so this can understate a decision that also
+    /// covers mail sitting in another tier. That is acceptable: the authoritative recount runs when
+    /// the write finishes and corrects any drift. What it buys is that the counts and the list stop
+    /// disagreeing with each other in the moment after a gesture.
+    func applyOptimisticTierShift(from: SafetyTier, to: SafetyTier, count: Int) {
+        guard let stats = accountStats else { return }
+        accountStats = stats.movingTier(from: from, to: to, count: count)
+    }
+
     /// Serializes decision work so rapid drags cannot undo each other.
     ///
     /// Each decision saves a correction and then recategorizes the whole sender by reading its
