@@ -511,13 +511,14 @@ struct TierEmailListView: View {
         action(email)
     }
 
-    /// Apply a decision to this email and everything from the same sender with the same subject.
+    /// Apply a decision to this email and every recurring issue of the same mail.
     private func decide(_ email: EmailMetadata, mustKeep: Bool) {
         Task {
             await appState.decideEmailAndItsRepeats(email, mustKeep: mustKeep)
-            // Reload so the row leaves this tier immediately: the decision moves it to
-            // protected or safe, so leaving it visible here would misreport the state.
-            await loadEmails()
+            // Reload so the decided rows leave immediately, but WITHOUT the loading state: a
+            // decision refresh that swaps the whole list for a spinner makes the list flash on
+            // every drag, and working through a queue means doing this many times in a row.
+            await loadEmails(showingProgress: false)
         }
     }
 
@@ -529,9 +530,9 @@ struct TierEmailListView: View {
         }
     }
 
-    private func loadEmails() async {
-        isLoading = true
-        defer { isLoading = false }
+    private func loadEmails(showingProgress: Bool = true) async {
+        if showingProgress { isLoading = true }
+        defer { if showingProgress { isLoading = false } }
         guard let account = appState.selectedAccount, let accountId = account.id else { return }
         do {
             // The review tier is a work queue, so order it weakest-confidence first.

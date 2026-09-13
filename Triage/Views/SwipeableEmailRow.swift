@@ -49,6 +49,13 @@ struct SwipeableEmailRow: View {
                 .gesture(dragGesture)
         }
         .opacity(isCommitting ? 0.35 : 1)
+        // Transient gesture state must never outlive the email it belongs to. A List reuses row
+        // state across a diff, so without this a row that has just been decided hands its offset
+        // and dimming to whichever email slides into its place.
+        .onChange(of: email.messageId) { _, _ in
+            dragX = 0
+            isCommitting = false
+        }
     }
 
     // MARK: - Gesture
@@ -84,6 +91,21 @@ struct SwipeableEmailRow: View {
         // rather than the row merely vanishing on the next reload.
         withAnimation(.easeOut(duration: 0.18)) { dragX = keep ? 400 : -400 }
         if keep { onKeep() } else { onDelete() }
+
+        // Then return it to rest, unconditionally.
+        //
+        // Leaving the row parked at the edge assumed the decision always removes it from the
+        // list, and that is false in two ways. Deciding mail in the SAFE tier to be deletable
+        // leaves it in the safe tier, so the row stays — parked offscreen forever. And when the
+        // reload does shorten the list, SwiftUI reuses row state across the diff, so a shifted
+        // row inherits this offset and dims itself while showing a different email. Both present
+        // as a row stuck halfway that comes right only after navigating away, because leaving the
+        // screen rebuilds the view and discards the state.
+        Task { @MainActor in
+            try? await Task.sleep(for: .milliseconds(220))
+            dragX = 0
+            isCommitting = false
+        }
     }
 
     // MARK: - Pieces
