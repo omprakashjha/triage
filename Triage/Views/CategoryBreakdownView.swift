@@ -413,12 +413,24 @@ struct TierEmailListView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                 }
-                // Stated, because a swipe gesture nobody knows about is not a feature. The
-                // keyboard path is the fast one once known, so it is named here too.
+                // Stated, because a gesture nobody knows about is not a feature. The keyboard
+                // path is the fast one once known, so it is named here too.
                 if !emails.isEmpty {
-                    Text("Swipe a row right to keep, left to mark it deletable — or select one and press K or D. Either applies to every email from the same sender with the same subject.")
+                    Text("Drag a row right to keep, left to mark it deletable — or select one and press K or D. Either applies to every email from the same sender with the same subject.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                // The outcome of a decision, shown HERE. It was already being recorded on
+                // AppState and displayed on three other screens but not on the one where the
+                // decisions are now made — so a swipe that succeeded and a swipe that silently
+                // failed looked identical, which is precisely the ambiguity that makes a UI
+                // impossible to trust.
+                if let status = appState.correctionStatus {
+                    Label(status, systemImage: "checkmark.circle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.green)
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
@@ -434,44 +446,38 @@ struct TierEmailListView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                // A List rather than a Table, because `.swipeActions` is List-only and swiping
-                // is the fastest way through a queue on a trackpad. What a Table gave up here
-                // was column resizing and sorting on a list that is already filtered to one
-                // tier and sorted by confidence — little to lose against a two-finger gesture
-                // per decision.
+                // A List rather than a Table, because the row needs to move under a gesture and
+                // a Table row cannot.
                 //
-                // All three affordances drive the same two actions on purpose. Swipe is fast
-                // but undiscoverable on macOS; the hover buttons make it visible that the
-                // actions exist; the keyboard is fastest once known. Offering only the gesture
-                // would hide the feature from anyone who did not already expect it.
+                // The gesture is implemented here rather than with `.swipeActions`, which did
+                // nothing on this machine. That modifier is documented as available on macOS but
+                // it listens for a two-finger trackpad swipe, which is a SCROLL event — on a
+                // mouse, or a trackpad the system reports differently, there is no gesture for it
+                // to hear and it silently never fires. A DragGesture responds to press-and-drag,
+                // which every pointing device produces.
+                //
+                // Doing it by hand also buys the thing the modifier could not: the row follows
+                // the pointer and names the action it is about to take, so the gesture is
+                // discovered by trying it rather than by being told.
                 List(emails, id: \.messageId, selection: $selectedMessageId) { email in
-                    emailRow(email)
-                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
-                            Button {
-                                decide(email, mustKeep: false)
-                            } label: {
-                                Label("Safe to delete", systemImage: "trash")
-                            }
-                            .tint(.orange)
+                    SwipeableEmailRow(
+                        email: email,
+                        showsHoverActions: hoveredMessageId == email.messageId,
+                        onKeep: { decide(email, mustKeep: true) },
+                        onDelete: { decide(email, mustKeep: false) },
+                        onEdit: { correctingEmail = email }
+                    )
+                    .onHover { hoveredMessageId = $0 ? email.messageId : nil }
+                    .contextMenu {
+                        Button("Safe to delete — this and its repeats") {
+                            decide(email, mustKeep: false)
                         }
-                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
-                            Button {
-                                decide(email, mustKeep: true)
-                            } label: {
-                                Label("Keep", systemImage: "lock.shield")
-                            }
-                            .tint(.green)
+                        Button("Keep — this and its repeats") {
+                            decide(email, mustKeep: true)
                         }
-                        .contextMenu {
-                            Button("Safe to delete — this and its repeats") {
-                                decide(email, mustKeep: false)
-                            }
-                            Button("Keep — this and its repeats") {
-                                decide(email, mustKeep: true)
-                            }
-                            Divider()
-                            Button("Correct this categorization…") { correctingEmail = email }
-                        }
+                        Divider()
+                        Button("Correct this categorization…") { correctingEmail = email }
+                    }
                 }
                 .listStyle(.inset)
             }
@@ -496,81 +502,6 @@ struct TierEmailListView: View {
         .sheet(item: $correctingEmail) { email in
             CorrectionSheet(email: email)
                 .environmentObject(appState)
-        }
-    }
-
-    /// One row, with the columns the Table used to provide.
-    private func emailRow(_ email: EmailMetadata) -> some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(email.subject)
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(email.senderEmail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    if let category = email.category {
-                        Text(category.displayName)
-                            .font(.caption2)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 1)
-                            .background(Color.secondary.opacity(0.15), in: Capsule())
-                            .foregroundStyle(.secondary)
-                    }
-                    Text(email.date, style: .date)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-                // The engine's justification, which is what lets a decision be made from the
-                // row instead of by opening something.
-                HStack(spacing: 6) {
-                    Text(email.categoryReason ?? "—")
-                        .font(.caption2)
-                        .lineLimit(2)
-                        .foregroundStyle(.secondary)
-                    if let confidence = email.categoryConfidence {
-                        ConfidenceBadge(confidence: confidence)
-                    }
-                }
-            }
-
-            Spacer(minLength: 0)
-
-            // Visible on hover, so the swipe actions are discoverable rather than folklore.
-            if hoveredMessageId == email.messageId {
-                HStack(spacing: 4) {
-                    Button {
-                        decide(email, mustKeep: true)
-                    } label: {
-                        Image(systemName: "lock.shield")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Keep this and its repeats (K)")
-
-                    Button {
-                        decide(email, mustKeep: false)
-                    } label: {
-                        Image(systemName: "trash")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Mark this and its repeats safe to delete (D)")
-
-                    Button {
-                        correctingEmail = email
-                    } label: {
-                        Image(systemName: "pencil.line")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Correct the categorization (Return)")
-                }
-                .transition(.opacity)
-            }
-        }
-        .padding(.vertical, 3)
-        .contentShape(Rectangle())
-        .onHover { inside in
-            hoveredMessageId = inside ? email.messageId : nil
         }
     }
 
