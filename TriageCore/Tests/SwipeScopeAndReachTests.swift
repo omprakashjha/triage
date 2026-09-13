@@ -44,7 +44,7 @@ final class SwipeScopeAndReachTests: XCTestCase {
         // than once per copy.
         let correction = UserCorrection(
             accountId: accountId,
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "Deel uw mening over Flex Dal Voordeel",
             category: .promotion,
             mustKeep: false
@@ -53,10 +53,10 @@ final class SwipeScopeAndReachTests: XCTestCase {
 
         let results = try await engine.categorize(emails: [
             // Two copies of the decided subject.
-            email("a", sender: "info@email.ns.nl", subject: "Deel uw mening over Flex Dal Voordeel"),
-            email("b", sender: "info@email.ns.nl", subject: "Deel uw mening over Flex Dal Voordeel"),
+            email("a", sender: "info@email.spoorwegen.example", subject: "Deel uw mening over Flex Dal Voordeel"),
+            email("b", sender: "info@email.spoorwegen.example", subject: "Deel uw mening over Flex Dal Voordeel"),
             // Same sender, different subject — untouched.
-            email("c", sender: "info@email.ns.nl", subject: "Uw factuur van maart"),
+            email("c", sender: "info@email.spoorwegen.example", subject: "Uw factuur van maart"),
             // Same subject, different sender — untouched.
             email("d", sender: "other@example.com", subject: "Deel uw mening over Flex Dal Voordeel"),
         ])
@@ -71,7 +71,7 @@ final class SwipeScopeAndReachTests: XCTestCase {
     func testSwipeKeepProtectsTheSameSenderAndSubject() async throws {
         let correction = UserCorrection(
             accountId: accountId,
-            senderEmail: "donotreply@interactivebrokers.com",
+            senderEmail: "donotreply@brokerage.example",
             subjectPattern: "Official Trade Confirmation",
             category: .transactional,
             mustKeep: true
@@ -79,10 +79,10 @@ final class SwipeScopeAndReachTests: XCTestCase {
         let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [correction])
 
         let results = try await engine.categorize(emails: [
-            email("a", sender: "donotreply@interactivebrokers.com",
+            email("a", sender: "donotreply@brokerage.example",
                   subject: "Official Trade Confirmation for 12 September"),
-            email("b", sender: "donotreply@interactivebrokers.com",
-                  subject: "Daily Activity Statement"),
+            email("b", sender: "donotreply@brokerage.example",
+                  subject: "Daily Account Statement"),
         ])
         let byId = Dictionary(uniqueKeysWithValues: results.map { ($0.messageId, $0) })
 
@@ -95,14 +95,14 @@ final class SwipeScopeAndReachTests: XCTestCase {
         // would discard the model's reading for nothing.
         let correction = UserCorrection(
             accountId: accountId,
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "Maak kans op een jaar gratis treinen",
             category: .notification,
             mustKeep: false
         )
         let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [correction])
         let results = try await engine.categorize(emails: [
-            email("a", sender: "info@email.ns.nl",
+            email("a", sender: "info@email.spoorwegen.example",
                   subject: "Maak kans op een jaar gratis treinen!")
         ])
 
@@ -113,19 +113,19 @@ final class SwipeScopeAndReachTests: XCTestCase {
     // MARK: - Reach feedback
 
     func testReachReportsMatchingOutOfTotal() async throws {
-        try await seed(sender: "info@email.ns.nl", subject: "Korting op reizen", count: 3)
-        try await seed(sender: "info@email.ns.nl", subject: "Uw factuur van maart", count: 2)
+        try await seed(sender: "info@email.spoorwegen.example", subject: "Korting op reizen", count: 3)
+        try await seed(sender: "info@email.spoorwegen.example", subject: "Uw factuur van maart", count: 2)
         try await seed(sender: "other@example.com", subject: "Korting op reizen", count: 5)
 
         let narrow = try await db.subjectPatternReach(
-            accountId: accountId, senderEmail: "info@email.ns.nl",
+            accountId: accountId, senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "Uw factuur van maart"
         )
         XCTAssertEqual(narrow.matching, 2)
         XCTAssertEqual(narrow.total, 5, "other senders are not counted")
 
         let wide = try await db.subjectPatternReach(
-            accountId: accountId, senderEmail: "info@email.ns.nl", subjectPattern: "korting"
+            accountId: accountId, senderEmail: "info@email.spoorwegen.example", subjectPattern: "korting"
         )
         XCTAssertEqual(wide.matching, 3, "matching is case-insensitive")
     }
@@ -153,18 +153,18 @@ final class SwipeScopeAndReachTests: XCTestCase {
     func testFullSubjectReachesOneWhileAWordReachesMany() async throws {
         // The distinction the prefilled field exists to teach: the full subject decides this
         // email, and deleting words is what turns it into a rule.
-        try await seed(sender: "info@email.ns.nl", subject: "Korting: dagje uit in maart")
-        try await seed(sender: "info@email.ns.nl", subject: "Korting: dagje uit in april")
-        try await seed(sender: "info@email.ns.nl", subject: "Uw reisoverzicht")
+        try await seed(sender: "info@email.spoorwegen.example", subject: "Korting: dagje uit in maart")
+        try await seed(sender: "info@email.spoorwegen.example", subject: "Korting: dagje uit in april")
+        try await seed(sender: "info@email.spoorwegen.example", subject: "Uw reisoverzicht")
 
         let exact = try await db.subjectPatternReach(
-            accountId: accountId, senderEmail: "info@email.ns.nl",
+            accountId: accountId, senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "Korting: dagje uit in maart"
         )
         XCTAssertEqual(exact.matching, 1)
 
         let generalised = try await db.subjectPatternReach(
-            accountId: accountId, senderEmail: "info@email.ns.nl",
+            accountId: accountId, senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "dagje uit"
         )
         XCTAssertEqual(generalised.matching, 2)

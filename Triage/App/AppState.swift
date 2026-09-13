@@ -794,7 +794,7 @@ final class AppState: ObservableObject {
     ///
     /// The scope is the user's own choice and it needs no new storage: a correction scoped to a
     /// subject already means "this sender, these subjects". A real correction from this mailbox
-    /// read "daily activity statement for 08/27/2026", which matches exactly one email, so the
+    /// read "daily account statement for 08/27/2026", which matches exactly one email, so the
     /// same decision would come back every day forever. The pattern is now the recurring STEM, so
     /// one gesture covers the family. See `SubjectStem`.
     ///

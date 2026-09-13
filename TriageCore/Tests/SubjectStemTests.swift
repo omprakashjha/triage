@@ -15,13 +15,13 @@ final class SubjectStemTests: XCTestCase {
         // The real correction from the user's mailbox. Matched one email; must now match the
         // family.
         XCTAssertEqual(
-            stem("Daily Activity Statement for 08/27/2026"),
-            "daily activity statement"
+            stem("Daily Account Statement for 08/27/2026"),
+            "daily account statement"
         )
         // Every issue of that mail must reduce to the SAME stem, which is the whole point.
         XCTAssertEqual(
-            stem("Daily Activity Statement for 09/13/2026"),
-            stem("Daily Activity Statement for 08/27/2026")
+            stem("Daily Account Statement for 09/13/2026"),
+            stem("Daily Account Statement for 08/27/2026")
         )
     }
 
@@ -91,8 +91,8 @@ final class SubjectStemTests: XCTestCase {
     // MARK: - decisionPattern contract
 
     func testDecisionPatternGeneralizesWhenItCan() {
-        let result = SubjectStem.decisionPattern(for: "Daily Activity Statement for 08/27/2026")
-        XCTAssertEqual(result.pattern, "daily activity statement")
+        let result = SubjectStem.decisionPattern(for: "Daily Account Statement for 08/27/2026")
+        XCTAssertEqual(result.pattern, "daily account statement")
         XCTAssertTrue(result.didGeneralize)
     }
 
@@ -112,7 +112,7 @@ final class SubjectStemTests: XCTestCase {
 
     func testDecisionPatternAlwaysReturnsSomethingUsable() {
         // The caller writes this into a correction, so it can never be empty.
-        for subject in ["", "   ", "#1", "Re:", "Daily Activity Statement for 08/27/2026"] {
+        for subject in ["", "   ", "#1", "Re:", "Daily Account Statement for 08/27/2026"] {
             let result = SubjectStem.decisionPattern(for: subject)
             XCTAssertEqual(result.pattern, result.pattern.trimmingCharacters(in: .whitespaces))
         }
@@ -123,7 +123,7 @@ final class SubjectStemTests: XCTestCase {
     func testStemsOfGenuinelyDifferentMailStayDifferent() {
         // Widening must not collapse distinct mail from one sender into a single decision.
         XCTAssertNotEqual(
-            stem("Daily Activity Statement for 08/27/2026"),
+            stem("Daily Account Statement for 08/27/2026"),
             stem("Earnings Notification")
         )
         XCTAssertNotEqual(

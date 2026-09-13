@@ -21,11 +21,11 @@ final class StemMatchesItsOwnSubjectTests: XCTestCase {
         "Invoice 12345 for September services",
         "Report for week 37 is ready",
         // Punctuation inside the kept phrase.
-        "Let op: Werkzaamheden Almere Centrum - Lelystad Centrum/Weesp/Naarden-Bussum",
-        "Ontdek NS-wandelroutes van station naar station",
-        "Nieuw bij NS: in- en uitchecken met betaalpas, creditcard of mobiel",
+        "Let op: Werkzaamheden Noordstad Centrum - Zuidstad Centrum/Westdorp/Oosthaven-Zuid",
+        "Ontdek Spoor-wandelroutes van station naar station",
+        "Nieuw bij Spoor: in- en uitchecken met betaalpas, creditcard of mobiel",
         // Trailing removals — the easy case, kept as a regression guard.
-        "Daily Activity Statement for 08/27/2026",
+        "Daily Account Statement for 08/27/2026",
         "Uw factuur van 13 september 2026",
         "Payment received: €1.234,56",
         // Nothing to remove at all.
@@ -76,17 +76,17 @@ final class StemMatchesItsOwnSubjectTests: XCTestCase {
         // The other kind of pattern: a word the user typed, which must keep matching literally.
         let correction = UserCorrection(
             accountId: 1,
-            senderEmail: "vitens@example.com",
+            senderEmail: "waterbedrijf@example.com",
             subjectPattern: "jaarafrekening",
             category: .transactional,
             mustKeep: true
         )
         XCTAssertTrue(correction.matches(
-            senderEmail: "vitens@example.com",
+            senderEmail: "waterbedrijf@example.com",
             subject: "Uw jaarafrekening van 2026 staat klaar"
         ))
         XCTAssertFalse(correction.matches(
-            senderEmail: "vitens@example.com",
+            senderEmail: "waterbedrijf@example.com",
             subject: "Uw factuur staat klaar"
         ))
     }
@@ -96,14 +96,14 @@ final class StemMatchesItsOwnSubjectTests: XCTestCase {
         // applied to both sides so this cannot depend on the user matching the punctuation exactly.
         let correction = UserCorrection(
             accountId: 1,
-            senderEmail: "info@email.ns.nl",
-            subjectPattern: "NS-wandelroutes",
+            senderEmail: "info@email.spoorwegen.example",
+            subjectPattern: "Spoor-wandelroutes",
             category: .promotion,
             mustKeep: false
         )
         XCTAssertTrue(correction.matches(
-            senderEmail: "info@email.ns.nl",
-            subject: "Ontdek NS wandelroutes van station naar station"
+            senderEmail: "info@email.spoorwegen.example",
+            subject: "Ontdek Spoor wandelroutes van station naar station"
         ))
     }
 
@@ -114,17 +114,17 @@ final class StemMatchesItsOwnSubjectTests: XCTestCase {
         ).pattern
         let correction = UserCorrection(
             accountId: 1,
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subjectPattern: pattern,
             category: .promotion,
             mustKeep: false
         )
         XCTAssertFalse(correction.matches(
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subject: "Uw factuur van 13 september 2026"
         ))
         XCTAssertFalse(correction.matches(
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subject: "Samen eropuit deze zomervakantie"
         ))
     }

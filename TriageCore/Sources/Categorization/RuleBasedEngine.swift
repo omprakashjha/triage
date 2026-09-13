@@ -112,7 +112,7 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
     /// pushes the sender to the model, the only component that can actually read it.
     ///
     /// Only SUBJECT-derived findings are affected. A listed domain means the same thing in
-    /// every language, so `chase.com` and `rabobank.nl` are untouched by this.
+    /// every language, so `chase.com` and `bank.example` are untouched by this.
     static func discountingEnglishPatternsOnForeignMail(
         _ result: CategorizationResult,
         email: EmailMetadata
@@ -406,8 +406,8 @@ public final class RuleBasedEngine: CategorizationEngine, @unchecked Sendable {
         // This used to return newsletter/.safe at 0.85, which was wrong twice over. A
         // `List-Unsubscribe` header proves mail is BULK, not that it is DISPOSABLE —
         // utilities, insurers and banks all send statements with one. Real example:
-        // "Jaarafrekening van waterbedrijf Vitens" (an annual water bill) from
-        // noreply@mail.vitens.nl was classified newsletter/.safe at 0.85 confidence.
+        // "Jaarafrekening van waterbedrijf Aquanet" (an annual water bill) from
+        // noreply@mail.waterbedrijf.example was classified newsletter/.safe at 0.85 confidence.
         //
         // The high confidence made it worse than a mere mislabel: 0.85 sits above the
         // AI engine's ambiguity threshold, so the sender was never sent for

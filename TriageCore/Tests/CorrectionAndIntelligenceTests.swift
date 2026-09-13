@@ -54,7 +54,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         // marketing from the same address is left to the rules.
         let correction = UserCorrection(
             accountId: 1,
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             subjectPattern: "factuur",
             category: .transactional,
             mustKeep: true
@@ -62,8 +62,8 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [correction])
 
         let results = try await engine.categorize(emails: [
-            email("a", sender: "info@email.ns.nl", subject: "Uw factuur van maart"),
-            email("b", sender: "info@email.ns.nl", subject: "Aanbieding: korting op reizen"),
+            email("a", sender: "info@email.spoorwegen.example", subject: "Uw factuur van maart"),
+            email("b", sender: "info@email.spoorwegen.example", subject: "Aanbieding: korting op reizen"),
         ])
         let byId = Dictionary(uniqueKeysWithValues: results.map { ($0.messageId, $0) })
 
@@ -74,18 +74,18 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
 
     func testMoreSpecificCorrectionWinsOverWholeSender() async throws {
         let broad = UserCorrection(
-            accountId: 1, senderEmail: "info@ns.nl",
+            accountId: 1, senderEmail: "info@spoorwegen.example",
             category: .promotion, mustKeep: false
         )
         let narrow = UserCorrection(
-            accountId: 1, senderEmail: "info@ns.nl", subjectPattern: "factuur",
+            accountId: 1, senderEmail: "info@spoorwegen.example", subjectPattern: "factuur",
             category: .transactional, mustKeep: true
         )
         // Deliberately supplied in the unhelpful order.
         let engine = CorrectingEngine(base: RuleBasedEngine(), corrections: [broad, narrow])
 
         let results = try await engine.categorize(emails: [
-            email(sender: "info@ns.nl", subject: "Uw factuur")
+            email(sender: "info@spoorwegen.example", subject: "Uw factuur")
         ])
 
         XCTAssertEqual(results[0].category, .transactional)
@@ -93,7 +93,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
     }
 
     func testKeepDecisionAloneDrivesTheTierForEveryCategory() async throws {
-        // Regression, found by the user: they set their broker's "daily activity statement"
+        // Regression, found by the user: they set their broker's "daily account statement"
         // to `notification` and unticked "never delete this automatically", and the mail
         // stayed in review — because the tier fell back to whether the CATEGORY is
         // typically disposable, and notifications are not. An explicit instruction was
@@ -123,8 +123,8 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         // The user's exact case, through the engine rather than the model in isolation.
         let correction = UserCorrection(
             accountId: 1,
-            senderEmail: "donotreply@interactivebrokers.com",
-            subjectPattern: "daily activity statement",
+            senderEmail: "donotreply@brokerage.example",
+            subjectPattern: "daily account statement",
             category: .notification,
             mustKeep: false
         )
@@ -132,8 +132,8 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
 
         let results = try await engine.categorize(emails: [
             email(
-                sender: "donotreply@interactivebrokers.com",
-                subject: "Daily Activity Statement for 4 September"
+                sender: "donotreply@brokerage.example",
+                subject: "Daily Account Statement for 4 September"
             )
         ])
 
@@ -164,7 +164,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
 
     func testVerdictSplitAppliesPerMessage() {
         let verdict = SenderVerdict(
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             category: .promotion,
             mustKeep: false,
             isRealPerson: false,
@@ -189,7 +189,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         // The model described a split and this message fits neither side, so it is one the
         // model did not account for. Keeping it is the only safe reading.
         let verdict = SenderVerdict(
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             category: .promotion,
             mustKeep: false,
             isRealPerson: false,
@@ -279,7 +279,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
             evidence: .strong
         )
         let mixedSenderVerdict = SenderVerdict(
-            senderEmail: "info@email.ns.nl",
+            senderEmail: "info@email.spoorwegen.example",
             category: .promotion,
             mustKeep: false,
             isRealPerson: false,
@@ -287,7 +287,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
             reason: "Mixed sender",
             disposableSubjects: ["korting"],
             keepSubjects: ["factuur"]
-        ).resolved(forSubject: "Beleef een betoverende kerstvakantie met NS Dagje Uit")
+        ).resolved(forSubject: "Beleef een betoverende kerstvakantie met Spoor Dagje Uit")
 
         XCTAssertTrue(mixedSenderVerdict.isUnsure, "an unmatched split is an abstention")
 
@@ -330,7 +330,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         let payload = JSONValue.object([
             "verdicts": .array([
                 .object([
-                    "senderEmail": "info@email.ns.nl",
+                    "senderEmail": "info@email.spoorwegen.example",
                     "category": "promotion",
                     "mustKeep": false,
                     "isRealPerson": false,
@@ -345,7 +345,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
                         "dagje uit",
                     ]),
                     "keepSubjects": .array([
-                        "let op: werkzaamheden almere centrum - weesp",
+                        "let op: werkzaamheden noordstad centrum - westdorp",
                         "werkzaamheden",
                     ]),
                 ])
@@ -368,14 +368,14 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         for i in 0..<10 {
             emails.append(email(
                 "new\(i)",
-                sender: "info@email.ns.nl",
+                sender: "info@email.spoorwegen.example",
                 subject: "Duurzame dinsdag: groen eropuit met de trein \(i)"
             ))
         }
-        for (i, subject) in ["Uw factuur van maart", "Werkzaamheden Almere", "Uw reisoverzicht"]
+        for (i, subject) in ["Uw factuur van maart", "Werkzaamheden Noordstad", "Uw reisoverzicht"]
             .enumerated()
         {
-            var old = email("old\(i)", sender: "info@email.ns.nl", subject: subject)
+            var old = email("old\(i)", sender: "info@email.spoorwegen.example", subject: subject)
             old.date = now.addingTimeInterval(-Double(i + 1) * 86400 * 90)
             emails.append(old)
         }
@@ -402,17 +402,17 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         // is why labels needed the same scope corrections already had.
         let labels = [
             GoldenLabel(
-                accountId: 1, senderEmail: "info@email.ns.nl",
+                accountId: 1, senderEmail: "info@email.spoorwegen.example",
                 expectedCategory: .promotion, disposition: .disposable
             ),
             GoldenLabel(
-                accountId: 1, senderEmail: "info@email.ns.nl", subjectPattern: "factuur",
+                accountId: 1, senderEmail: "info@email.spoorwegen.example", subjectPattern: "factuur",
                 expectedCategory: .transactional, disposition: .mustKeep
             ),
         ]
 
-        let receipt = email("a", sender: "info@email.ns.nl", subject: "Uw factuur van maart")
-        let promo = email("b", sender: "info@email.ns.nl", subject: "Korting op reizen")
+        let receipt = email("a", sender: "info@email.spoorwegen.example", subject: "Uw factuur van maart")
+        let promo = email("b", sender: "info@email.spoorwegen.example", subject: "Korting op reizen")
 
         let results = [
             CategorizationResult(
@@ -505,7 +505,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         let payload = JSONValue.object([
             "verdicts": .array([
                 .object([
-                    "senderEmail": "info@email.ns.nl",
+                    "senderEmail": "info@email.spoorwegen.example",
                     "category": "promotion",
                     "mustKeep": false,
                     "isRealPerson": false,
@@ -584,7 +584,7 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         )
         let unchanged = RuleBasedEngine.discountingEnglishPatternsOnForeignMail(
             domainFinding,
-            email: email(sender: "noreply@rabobank.nl", subject: "Uw rekeningoverzicht")
+            email: email(sender: "noreply@bank.example", subject: "Uw rekeningoverzicht")
         )
 
         XCTAssertEqual(unchanged.evidence, .strong)
@@ -595,14 +595,14 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
     func testCorrectionsAppearInTheSystemPrompt() {
         let prompt = SenderClassificationPrompt.systemPrompt(corrections: [
             CorrectionExample(
-                senderEmail: "noreply@mail.vitens.nl",
+                senderEmail: "noreply@mail.waterbedrijf.example",
                 subjectPattern: nil,
                 category: .transactional,
                 mustKeep: true
             )
         ])
 
-        XCTAssertTrue(prompt.contains("noreply@mail.vitens.nl"))
+        XCTAssertTrue(prompt.contains("noreply@mail.waterbedrijf.example"))
         XCTAssertTrue(prompt.contains("transactional"))
         XCTAssertTrue(prompt.contains("must be kept"))
         XCTAssertTrue(prompt.contains("CORRECT by definition"))

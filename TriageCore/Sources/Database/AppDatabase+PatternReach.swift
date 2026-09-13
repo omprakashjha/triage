@@ -8,7 +8,7 @@ public extension AppDatabase {
     ///
     /// Exists to make the generalisation tradeoff visible AT THE MOMENT of deciding. A pattern
     /// is a rule for mail that has not arrived yet, and the difference between a good one and a
-    /// useless one is invisible while typing: "Jaarafrekening van waterbedrijf Vitens" matches
+    /// useless one is invisible while typing: "Jaarafrekening van waterbedrijf Aquanet" matches
     /// the one email it came from, while "jaarafrekening" matches every annual statement the
     /// utility will ever send. The model made exactly this mistake last night, returning whole
     /// subject lines as "patterns" that matched one message each — there is no reason to make

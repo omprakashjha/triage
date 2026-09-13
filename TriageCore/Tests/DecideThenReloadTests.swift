@@ -65,14 +65,14 @@ final class DecideThenReloadTests: XCTestCase {
     }
 
     func testADecidedEmailLeavesTheReviewQuery() async throws {
-        let email = reviewEmail("a", sender: "donotreply@interactivebrokers.com",
-                                subject: "Daily Activity Statement for 08/27/2026")
+        let email = reviewEmail("a", sender: "donotreply@brokerage.example",
+                                subject: "Daily Account Statement for 08/27/2026")
         try await db.upsertEmails([email])
         let before = try await db.fetchEmailsForReview(accountId: accountId).count
         XCTAssertEqual(before, 1)
 
         let remaining = try await decide(
-            email: email, mustKeep: false, pattern: "daily activity statement"
+            email: email, mustKeep: false, pattern: "daily account statement"
         )
         XCTAssertTrue(
             remaining.isEmpty,
@@ -93,9 +93,9 @@ final class DecideThenReloadTests: XCTestCase {
     func testTheStemRemovesEveryRecurringIssueAtOnce() async throws {
         // The whole point of the stem: one decision empties the family.
         let subjects = [
-            "Daily Activity Statement for 08/27/2026",
-            "Daily Activity Statement for 09/01/2026",
-            "Daily Activity Statement for 09/13/2026",
+            "Daily Account Statement for 08/27/2026",
+            "Daily Account Statement for 09/01/2026",
+            "Daily Account Statement for 09/13/2026",
         ]
         var emails: [EmailMetadata] = []
         for (i, subject) in subjects.enumerated() {
@@ -108,7 +108,7 @@ final class DecideThenReloadTests: XCTestCase {
         XCTAssertEqual(before, 4)
 
         let (pattern, didGeneralize) = SubjectStem.decisionPattern(
-            for: "Daily Activity Statement for 08/27/2026"
+            for: "Daily Account Statement for 08/27/2026"
         )
         XCTAssertTrue(didGeneralize)
 
@@ -132,14 +132,14 @@ final class DecideThenReloadTests: XCTestCase {
         // corrections it would revert them, which is the data-level half of the bug where only the
         // first drag appeared to take effect. This pins that they accumulate.
         let emails = [
-            reviewEmail("a", sender: "ib@example.com", subject: "Daily Activity Statement for 08/27/2026"),
+            reviewEmail("a", sender: "ib@example.com", subject: "Daily Account Statement for 08/27/2026"),
             reviewEmail("b", sender: "ib@example.com", subject: "Earnings Notification"),
             reviewEmail("c", sender: "ib@example.com", subject: "Trade Confirmation 12345"),
         ]
         try await db.upsertEmails(emails)
 
         // Three decisions in sequence, mixing keep and discard.
-        _ = try await decide(email: emails[0], mustKeep: false, pattern: "daily activity statement")
+        _ = try await decide(email: emails[0], mustKeep: false, pattern: "daily account statement")
         _ = try await decide(email: emails[1], mustKeep: false, pattern: "earnings notification")
         let remaining = try await decide(email: emails[2], mustKeep: true, pattern: "trade confirmation")
 

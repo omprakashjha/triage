@@ -89,7 +89,7 @@ public struct UserCorrection: Codable, FetchableRecord, PersistableRecord, Senda
     /// separately.
     ///
     /// This previously fell back to `category.isTypicallyDisposable`, so a user who
-    /// categorised their broker's daily activity statements as `notification` and
+    /// categorised their broker's daily account statements as `notification` and
     /// explicitly unticked "never delete this automatically" got `.review` anyway — because
     /// notifications are not "typically" disposable. That is an instruction being overruled
     /// by a heuristic, which is the failure mode this whole type exists to end. 27 emails

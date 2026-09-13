@@ -415,7 +415,7 @@ public final class AICategorizationEngine: CategorizationEngine {
     /// generalising rule can be written.
     ///
     /// Near-duplicate subjects are collapsed to their leading words, because twelve
-    /// "Daily Activity Statement for <date>" messages teach the model nothing that one does,
+    /// "Daily Account Statement for <date>" messages teach the model nothing that one does,
     /// while crowding out the variety that would.
     static func representativeSubjects(of emails: [EmailMetadata], limit: Int = 20) -> [String] {
         guard !emails.isEmpty else { return [] }

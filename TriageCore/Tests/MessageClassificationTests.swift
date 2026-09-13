@@ -147,7 +147,7 @@ final class MessageClassificationTests: XCTestCase {
         let body = MessageClassificationPrompt.userMessage(for: [
             MessageClassificationRequest(
                 messageId: "m1",
-                senderEmail: "info@email.ns.nl",
+                senderEmail: "info@email.spoorwegen.example",
                 displayName: "NS",
                 subject: "7 januari minder treinen door winters weer",
                 snippet: "Door de verwachte sneeuw rijden er minder treinen.",
@@ -167,11 +167,11 @@ final class MessageClassificationTests: XCTestCase {
     func testCorrectionsReachTheMessagePromptToo() {
         let prompt = MessageClassificationPrompt.systemPrompt(corrections: [
             CorrectionExample(
-                senderEmail: "noreply@mail.vitens.nl", subjectPattern: nil,
+                senderEmail: "noreply@mail.waterbedrijf.example", subjectPattern: nil,
                 category: .transactional, mustKeep: true
             )
         ])
-        XCTAssertTrue(prompt.contains("noreply@mail.vitens.nl"))
+        XCTAssertTrue(prompt.contains("noreply@mail.waterbedrijf.example"))
         XCTAssertTrue(prompt.contains("CORRECT by definition"))
     }
 }

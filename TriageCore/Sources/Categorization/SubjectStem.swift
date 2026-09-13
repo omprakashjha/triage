@@ -4,11 +4,11 @@ import Foundation
 ///
 /// Motivated by a real correction in the user's own mailbox:
 ///
-///     subjectPattern = "daily activity statement for 08/27/2026"   mustKeep = 1
+///     subjectPattern = "daily account statement for 08/27/2026"   mustKeep = 1
 ///
 /// That pattern matches exactly one email. The next day's statement is a different subject, so the
 /// same decision would have to be made again every single day, forever — which defeats the point
-/// of deciding by subject at all. The stem is `daily activity statement`, and that covers the
+/// of deciding by subject at all. The stem is `daily account statement`, and that covers the
 /// family.
 ///
 /// The approach is to remove what VARIES between issues of the same recurring mail and keep what
@@ -27,9 +27,9 @@ public enum SubjectStem {
     /// This exists because they disagreed, and the consequences were invisible. A stem is built by
     /// replacing punctuation with spaces, so
     ///
-    ///     "Let op: Werkzaamheden Almere Centrum - Lelystad Centrum/Weesp/Naarden-Bussum"
+    ///     "Let op: Werkzaamheden Noordstad Centrum - Zuidstad Centrum/Westdorp/Oosthaven-Zuid"
     ///
-    /// yields `let op werkzaamheden almere centrum lelystad centrum weesp naarden bussum`, which is
+    /// yields `let op werkzaamheden noordstad centrum zuidstad centrum westdorp oosthaven zuid`, which is
     /// NOT a substring of the original — the colon, the dash and the slashes are gone. Matching was
     /// a plain `subject.contains(pattern)` against the raw subject, so the pattern could not match
     /// the very email it was derived from. The correction saved, the recategorization ran, and
