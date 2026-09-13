@@ -6,22 +6,40 @@ struct CategoryBreakdownView: View {
     @EnvironmentObject private var appState: AppState
     let stats: AccountStats
 
-    @State private var selectedCategory: EmailCategory?
-    @State private var selectedTier: SafetyTier?
+    /// What the left list has selected — a category OR a tier, never both and never neither
+    /// tracked separately.
+    ///
+    /// Two optionals plus an `.onTapGesture` is what this was, and it is the same defect shape as
+    /// the sidebar: the tier rows wrote BOTH `selectedCategory = nil` and `selectedTier = …` from
+    /// a tap gesture living inside a selection-bound List, so one click drove the List's own
+    /// selection machinery and two state writes at once. HSplitView then rebuilt both panes and
+    /// collapsed the left one. Category rows used the native `.tag` path and were unaffected,
+    /// which is exactly the asymmetry the user reported.
+    ///
+    /// One value, set only through the List's selection binding, means one mechanism and a right
+    /// pane that is a pure function of it.
+    private enum Selection: Hashable {
+        case category(EmailCategory)
+        case tier(SafetyTier)
+    }
+
+    @State private var selection: Selection?
 
     var body: some View {
         HSplitView {
-            // Left: Category list
             categoryList
                 .frame(minWidth: 250, maxWidth: 350)
 
-            // Right: Email list for selected category or tier
-            if let category = selectedCategory {
+            // A minimum width on the detail side too. HSplitView distributes space when its
+            // children change, and a detail view with no floor can take the whole width.
+            switch selection {
+            case .category(let category):
                 EmailListView(category: category)
-                    .onChange(of: selectedCategory) { _, _ in selectedTier = nil }
-            } else if let tier = selectedTier {
+                    .frame(minWidth: 420)
+            case .tier(let tier):
                 TierEmailListView(tier: tier)
-            } else {
+                    .frame(minWidth: 420)
+            case nil:
                 VStack {
                     Image(systemName: "envelope.open")
                         .font(.system(size: 48))
@@ -29,7 +47,7 @@ struct CategoryBreakdownView: View {
                     Text("Select a category to view emails")
                         .foregroundStyle(.secondary)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
             }
         }
     }
@@ -77,7 +95,7 @@ struct CategoryBreakdownView: View {
             Divider()
 
             // Categories
-            List(selection: $selectedCategory) {
+            List(selection: $selection) {
                 Section("Categories") {
                     ForEach(sortedCategories, id: \.category) { item in
                         CategoryRow(
@@ -85,17 +103,20 @@ struct CategoryBreakdownView: View {
                             count: item.count,
                             percentage: Double(item.count) / Double(max(stats.totalEmails, 1))
                         )
-                        .tag(item.category)
+                        .tag(Selection.category(item.category))
                     }
                 }
 
                 Section("Safety Tiers") {
+                    // Tagged, exactly like the category rows. These previously used
+                    // `.onTapGesture` to write two separate selections, which competed with the
+                    // List's own selection handling and collapsed the split view's left pane.
                     TierRow(tier: .safe, count: stats.tierBreakdown[.safe] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .safe }
+                        .tag(Selection.tier(.safe))
                     TierRow(tier: .review, count: stats.tierBreakdown[.review] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .review }
+                        .tag(Selection.tier(.review))
                     TierRow(tier: .protected_, count: stats.tierBreakdown[.protected_] ?? 0)
-                        .onTapGesture { selectedCategory = nil; selectedTier = .protected_ }
+                        .tag(Selection.tier(.protected_))
                 }
 
                 if stats.uncategorizedEmails > 0 {
