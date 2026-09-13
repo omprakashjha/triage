@@ -54,10 +54,29 @@ public enum SubjectStem {
     }
 
     /// Whether a stored pattern applies to a subject, under one consistent normalization.
+    ///
+    /// Two forms of pattern have to work here, and they need different comparisons.
+    ///
+    /// A HAND-TYPED pattern ("jaarafrekening") is a literal the user expects to find in the subject,
+    /// so it is matched against the normalized subject.
+    ///
+    /// A GENERATED stem has had varying tokens removed, and not only from the ends. In
+    ///
+    ///     "Duurzame Dinsdag: groen eropuit met de trein"
+    ///
+    /// the weekday is removed from the MIDDLE, leaving `duurzame groen eropuit met de trein`, which
+    /// is not a contiguous substring of the subject and so can never be found in it. Comparing it
+    /// against the subject's OWN stem works, because that had the same tokens removed.
+    ///
+    /// Accepting either form is deliberate: it keeps typed patterns matching literally while making
+    /// generated ones match reliably, and neither can be expressed in terms of the other.
     public static func pattern(_ pattern: String, matches subject: String) -> Bool {
         let normalizedPattern = normalizedForMatching(pattern)
         guard !normalizedPattern.isEmpty else { return true }
-        return normalizedForMatching(subject).contains(normalizedPattern)
+        if normalizedForMatching(subject).contains(normalizedPattern) { return true }
+        if let subjectStem = stem(of: subject),
+           normalizedForMatching(subjectStem).contains(normalizedPattern) { return true }
+        return false
     }
 
     /// Words that carry no identifying signal, so a stem consisting only of these is not a stem.
