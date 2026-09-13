@@ -756,6 +756,38 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// How many of a sender's emails a subject pattern matches, for live scope feedback.
+    func subjectPatternReach(
+        senderEmail: String,
+        subjectPattern: String,
+        accountId: Int64
+    ) async -> (matching: Int, total: Int)? {
+        try? await database.subjectPatternReach(
+            accountId: accountId,
+            senderEmail: senderEmail,
+            subjectPattern: subjectPattern
+        )
+    }
+
+    /// Decide one email and everything from the same sender with the same subject.
+    ///
+    /// The scope is the user's own choice and it is a better one than a per-message decision
+    /// would have been: it needs no new storage, because a correction scoped to the subject
+    /// already means exactly "this sender, this subject". Recurring mail — a monthly statement,
+    /// a repeated survey invitation, a re-sent notice — is decided once instead of once per copy.
+    ///
+    /// The CATEGORY is preserved deliberately. A swipe decides an email's fate, not its
+    /// classification, and overwriting the category would throw away the model's reading for no
+    /// reason.
+    func decideEmailAndItsRepeats(_ email: EmailMetadata, mustKeep: Bool) async {
+        await correctCategory(
+            for: email,
+            to: email.category ?? .unknown,
+            mustKeep: mustKeep,
+            scopeToSubjectPattern: email.subject
+        )
+    }
+
     // MARK: - Corrections
 
     func loadCorrections(accountId: Int64) async {

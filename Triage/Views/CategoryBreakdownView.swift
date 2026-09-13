@@ -364,6 +364,13 @@ struct EmailListView: View {
 struct TierEmailListView: View {
     /// The email whose categorization the user is fixing, if any.
     @State private var correctingEmail: EmailMetadata?
+    /// Local @State, deliberately not a @Published on AppState.
+    ///
+    /// A List whose selection binding writes shared observable state, in a view that also
+    /// mutates other observable state on the same tap, is what emptied the sidebar last night.
+    /// Selection that nothing outside this screen needs has no business leaving it.
+    @State private var selectedMessageId: String?
+    @State private var hoveredMessageId: String?
 
     @EnvironmentObject private var appState: AppState
     let tier: SafetyTier
@@ -374,15 +381,25 @@ struct TierEmailListView: View {
     var body: some View {
         VStack(spacing: 0) {
             // Header
-            HStack {
-                Circle()
-                    .fill(tierColor)
-                    .frame(width: 10, height: 10)
-                Text(tier.displayName)
-                    .font(.headline)
-                Text("(\(emails.count) emails)")
-                    .foregroundStyle(.secondary)
-                Spacer()
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Circle()
+                        .fill(tierColor)
+                        .frame(width: 10, height: 10)
+                    Text(tier.displayName)
+                        .font(.headline)
+                    Text("(\(emails.count) emails)")
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                // Stated, because a swipe gesture nobody knows about is not a feature. The
+                // keyboard path is the fast one once known, so it is named here too.
+                if !emails.isEmpty {
+                    Text("Swipe a row right to keep, left to mark it deletable — or select one and press K or D. Either applies to every email from the same sender with the same subject.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
             .padding()
 
@@ -396,66 +413,61 @@ struct TierEmailListView: View {
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                Table(emails) {
-                    TableColumn("Sender") { email in
-                        VStack(alignment: .leading) {
-                            Text(email.sender)
-                                .fontWeight(.medium)
-                            Text(email.senderEmail)
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
+                // A List rather than a Table, because `.swipeActions` is List-only and swiping
+                // is the fastest way through a queue on a trackpad. What a Table gave up here
+                // was column resizing and sorting on a list that is already filtered to one
+                // tier and sorted by confidence — little to lose against a two-finger gesture
+                // per decision.
+                //
+                // All three affordances drive the same two actions on purpose. Swipe is fast
+                // but undiscoverable on macOS; the hover buttons make it visible that the
+                // actions exist; the keyboard is fastest once known. Offering only the gesture
+                // would hide the feature from anyone who did not already expect it.
+                List(emails, id: \.messageId, selection: $selectedMessageId) { email in
+                    emailRow(email)
+                        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                            Button {
+                                decide(email, mustKeep: false)
+                            } label: {
+                                Label("Safe to delete", systemImage: "trash")
+                            }
+                            .tint(.orange)
+                        }
+                        .swipeActions(edge: .leading, allowsFullSwipe: true) {
+                            Button {
+                                decide(email, mustKeep: true)
+                            } label: {
+                                Label("Keep", systemImage: "lock.shield")
+                            }
+                            .tint(.green)
                         }
                         .contextMenu {
+                            Button("Safe to delete — this and its repeats") {
+                                decide(email, mustKeep: false)
+                            }
+                            Button("Keep — this and its repeats") {
+                                decide(email, mustKeep: true)
+                            }
+                            Divider()
                             Button("Correct this categorization…") { correctingEmail = email }
                         }
-                    }
-                    .width(min: 150, ideal: 200)
-
-                    TableColumn("Subject") { email in
-                        Text(email.subject)
-                            .lineLimit(1)
-                    }
-                    .width(min: 200, ideal: 300)
-
-                    TableColumn("") { email in
-                        Button {
-                            correctingEmail = email
-                        } label: {
-                            Image(systemName: "pencil.line")
-                        }
-                        .buttonStyle(.borderless)
-                        .help("Correct this categorization")
-                    }
-                    .width(28)
-
-                    TableColumn("Category") { email in
-                        if let category = email.category {
-                            Text(category.displayName)
-                                .font(.caption)
-                        }
-                    }
-                    .width(80)
-
-                    TableColumn("Date") { email in
-                        Text(email.date, style: .date)
-                            .font(.caption)
-                    }
-                    .width(80)
-
-                    TableColumn("Why") { email in
-                        VStack(alignment: .leading, spacing: 1) {
-                            Text(email.categoryReason ?? "—")
-                                .font(.caption2)
-                                .lineLimit(2)
-                                .foregroundStyle(.secondary)
-                            if let confidence = email.categoryConfidence {
-                                ConfidenceBadge(confidence: confidence)
-                            }
-                        }
-                    }
-                    .width(min: 140, ideal: 220)
                 }
+                .listStyle(.inset)
             }
+        }
+        // Keyboard shortcuts on hidden buttons, which is how a List row action gets a shortcut:
+        // they act on the selected row, so D and K work once a row is selected with the arrows.
+        .background {
+            VStack {
+                Button("") { withSelected { decide($0, mustKeep: false) } }
+                    .keyboardShortcut("d", modifiers: [])
+                Button("") { withSelected { decide($0, mustKeep: true) } }
+                    .keyboardShortcut("k", modifiers: [])
+                Button("") { withSelected { correctingEmail = $0 } }
+                    .keyboardShortcut(.return, modifiers: [])
+            }
+            .opacity(0)
+            .allowsHitTesting(false)
         }
         .task(id: tier) {
             await loadEmails()
@@ -463,6 +475,97 @@ struct TierEmailListView: View {
         .sheet(item: $correctingEmail) { email in
             CorrectionSheet(email: email)
                 .environmentObject(appState)
+        }
+    }
+
+    /// One row, with the columns the Table used to provide.
+    private func emailRow(_ email: EmailMetadata) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            VStack(alignment: .leading, spacing: 2) {
+                Text(email.subject)
+                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(email.senderEmail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if let category = email.category {
+                        Text(category.displayName)
+                            .font(.caption2)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.15), in: Capsule())
+                            .foregroundStyle(.secondary)
+                    }
+                    Text(email.date, style: .date)
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+                // The engine's justification, which is what lets a decision be made from the
+                // row instead of by opening something.
+                HStack(spacing: 6) {
+                    Text(email.categoryReason ?? "—")
+                        .font(.caption2)
+                        .lineLimit(2)
+                        .foregroundStyle(.secondary)
+                    if let confidence = email.categoryConfidence {
+                        ConfidenceBadge(confidence: confidence)
+                    }
+                }
+            }
+
+            Spacer(minLength: 0)
+
+            // Visible on hover, so the swipe actions are discoverable rather than folklore.
+            if hoveredMessageId == email.messageId {
+                HStack(spacing: 4) {
+                    Button {
+                        decide(email, mustKeep: true)
+                    } label: {
+                        Image(systemName: "lock.shield")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Keep this and its repeats (K)")
+
+                    Button {
+                        decide(email, mustKeep: false)
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Mark this and its repeats safe to delete (D)")
+
+                    Button {
+                        correctingEmail = email
+                    } label: {
+                        Image(systemName: "pencil.line")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Correct the categorization (Return)")
+                }
+                .transition(.opacity)
+            }
+        }
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .onHover { inside in
+            hoveredMessageId = inside ? email.messageId : nil
+        }
+    }
+
+    private func withSelected(_ action: (EmailMetadata) -> Void) {
+        guard let id = selectedMessageId,
+              let email = emails.first(where: { $0.messageId == id }) else { return }
+        action(email)
+    }
+
+    /// Apply a decision to this email and everything from the same sender with the same subject.
+    private func decide(_ email: EmailMetadata, mustKeep: Bool) {
+        Task {
+            await appState.decideEmailAndItsRepeats(email, mustKeep: mustKeep)
+            // Reload so the row leaves this tier immediately: the decision moves it to
+            // protected or safe, so leaving it visible here would misreport the state.
+            await loadEmails()
         }
     }
 
