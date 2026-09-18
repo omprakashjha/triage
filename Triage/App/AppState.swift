@@ -13,6 +13,8 @@ final class AppState: ObservableObject {
         case overview
         case decide
         case senders
+        /// Subscriptions ranked by the mail ending them would stop arriving.
+        case subscriptions
         case history
         case evaluation
         case settings
@@ -596,15 +598,73 @@ final class AppState: ObservableObject {
     /// Only ever user-initiated. One-click is attempted only when the sender advertised
     /// RFC 8058 support; otherwise the web page is opened for the user to complete,
     /// because a blind POST to a GET-only confirmation page can do the wrong thing.
+    /// Senders worth unsubscribing from, ranked by mail prevented per year.
+    @Published var unsubscribeCandidates: [UnsubscribeCandidate] = []
+    /// Which account those candidates were loaded for, so an empty list cannot be mistaken for
+    /// "nothing to do" while a different account is selected.
+    @Published var unsubscribeLoadedAccountId: Int64?
+
+    func loadUnsubscribeCandidates(accountId: Int64) async {
+        do {
+            unsubscribeCandidates = try await database.unsubscribeCandidates(accountId: accountId)
+            unsubscribeLoadedAccountId = accountId
+        } catch {
+            unsubscribeMessage = "Could not load subscriptions: \(error.localizedDescription)"
+        }
+    }
+
+    /// Unsubscribe from several senders in one user-confirmed run.
+    ///
+    /// Sequential on purpose. Each one is an outbound request to a third party, several of them open
+    /// a browser tab when one-click is unavailable, and a burst of parallel requests to the same ESP
+    /// is the kind of thing that gets throttled or treated as abuse. There is also nothing to gain:
+    /// the user has already made the decision, so latency here costs them nothing.
+    func unsubscribeFromAll(senderEmails: [String], accountId: Int64) async {
+        var succeeded = 0
+        var needsAttention: [String] = []
+
+        for sender in senderEmails {
+            await unsubscribe(senderEmail: sender, accountId: accountId)
+            // unsubscribeMessage is set by the single-sender path; a one-click success is the only
+            // outcome that needed no further action from the user.
+            if unsubscribeMessage?.hasPrefix("Unsubscribed from") == true {
+                succeeded += 1
+            } else {
+                needsAttention.append(sender)
+            }
+        }
+
+        var summary = "Unsubscribed from \(succeeded) of \(senderEmails.count)."
+        if !needsAttention.isEmpty {
+            summary += " Needs you to finish: \(needsAttention.joined(separator: ", "))."
+        }
+        unsubscribeMessage = summary
+        await loadUnsubscribeCandidates(accountId: accountId)
+    }
+
+    /// Attempt to unsubscribe from a sender.
+    ///
+    /// Only ever user-initiated. One-click is attempted only when the sender advertised
+    /// RFC 8058 support; otherwise the web page is opened for the user to complete,
+    /// because a blind POST to a GET-only confirmation page can do the wrong thing.
     func unsubscribe(from summary: SenderSummary, accountId: Int64) async {
+        await unsubscribe(senderEmail: summary.senderEmail, accountId: accountId)
+    }
+
+    /// The same, addressed by sender rather than by a loaded summary.
+    ///
+    /// Split out because the ranked subscription list works from `UnsubscribeCandidate` and had no
+    /// reason to build a whole `SenderSummary` just to pass one string through.
+    func unsubscribe(senderEmail: String, accountId: Int64) async {
+        let summaryEmail = senderEmail
         unsubscribeMessage = nil
 
         do {
             guard let info = try await database.latestUnsubscribeInfo(
                 accountId: accountId,
-                senderEmail: summary.senderEmail
+                senderEmail: summaryEmail
             ) else {
-                unsubscribeMessage = "No unsubscribe option found for \(summary.senderEmail)."
+                unsubscribeMessage = "No unsubscribe option found for \(summaryEmail)."
                 return
             }
 
@@ -617,20 +677,20 @@ final class AppState: ObservableObject {
             case .oneClickSucceeded:
                 try await database.recordUnsubscribeAttempt(
                     UnsubscribeAttempt(
-                        senderEmail: summary.senderEmail,
+                        senderEmail: summaryEmail,
                         method: "one-click",
                         succeeded: true
                     ),
                     accountId: accountId
                 )
-                unsubscribeMessage = "Unsubscribed from \(summary.senderEmail). "
+                unsubscribeMessage = "Unsubscribed from \(summaryEmail). "
                     + "If mail keeps arriving after 10 days it will be flagged as ignored."
 
             case .needsBrowser(let url):
                 NSWorkspace.shared.open(url)
                 try await database.recordUnsubscribeAttempt(
                     UnsubscribeAttempt(
-                        senderEmail: summary.senderEmail,
+                        senderEmail: summaryEmail,
                         method: "browser",
                         succeeded: false,
                         note: "Opened \(url.host ?? "the sender's page") — needs completing in the browser."
@@ -644,7 +704,7 @@ final class AppState: ObservableObject {
                     + "Send an empty message to \(address) from \(selectedAccount?.email ?? "this account")."
 
             case .unavailable:
-                unsubscribeMessage = "The unsubscribe header from \(summary.senderEmail) has no usable link."
+                unsubscribeMessage = "The unsubscribe header from \(summaryEmail) has no usable link."
             }
         } catch {
             unsubscribeMessage = "Unsubscribe failed: \(error.localizedDescription)"
