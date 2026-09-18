@@ -29,7 +29,7 @@ public struct ActionPlan: Sendable {
 
     /// Total emails that will be acted upon
     public var totalApproved: Int {
-        items.filter(\.isApproved).reduce(0) { $0 + $1.entries.count }
+        items.filter(\.isApproved).reduce(0) { $0 + $1.approvedCount }
     }
 }
 
@@ -40,18 +40,53 @@ public struct ActionPlanItem: Identifiable, Sendable {
     public let action: EmailAction
     public let entries: [ActionPlanEntry]
     public var isApproved: Bool
+    /// Messages the user has taken OUT of this item, by message id.
+    ///
+    /// Approval was previously all-or-nothing per item, so the smallest thing this app could execute
+    /// was a whole category — which meant its first ever deletion would have been forty-four
+    /// messages at once, on a code path that had never run, with an undo that had never run either.
+    /// Excluding by id lets the same plan be executed for one sender first.
+    ///
+    /// Empty by default, so an item built without touching this behaves exactly as before.
+    public var excludedMessageIds: Set<String>
     public let ageFilter: Int?  // Only include emails older than N days (nil = all)
     public let reason: String
 
-    public init(id: String, category: EmailCategory, action: EmailAction, entries: [ActionPlanEntry], isApproved: Bool, ageFilter: Int? = nil, reason: String = "") {
+    public init(
+        id: String,
+        category: EmailCategory,
+        action: EmailAction,
+        entries: [ActionPlanEntry],
+        isApproved: Bool,
+        excludedMessageIds: Set<String> = [],
+        ageFilter: Int? = nil,
+        reason: String = ""
+    ) {
         self.id = id
         self.category = category
         self.action = action
         self.entries = entries
         self.isApproved = isApproved
+        self.excludedMessageIds = excludedMessageIds
         self.ageFilter = ageFilter
         self.reason = reason
     }
+
+    /// The entries that would actually be acted on.
+    ///
+    /// Everything that executes MUST read this rather than `entries`. A UI that lets the user
+    /// deselect mail while the executor still reads the full list would be worse than having no
+    /// selection at all, because it would silently delete what the user had just excluded.
+    public var approvedEntries: [ActionPlanEntry] {
+        guard !excludedMessageIds.isEmpty else { return entries }
+        return entries.filter { !excludedMessageIds.contains($0.messageId) }
+    }
+
+    /// How many messages this item would act on, after exclusions.
+    public var approvedCount: Int { approvedEntries.count }
+
+    /// Whether the user has excluded everything, leaving an approved item with nothing to do.
+    public var isEffectivelyEmpty: Bool { isApproved && approvedEntries.isEmpty }
 
     public var emailCount: Int { entries.count }
 
@@ -283,8 +318,8 @@ public struct ActionPlanner: Sendable {
 
         // Calculate summary
         let protectedCount = emails.filter { $0.safetyTier == .protected_ }.count
-        let toArchive = items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.emailCount }
-        let toDelete = items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.emailCount }
+        let toArchive = items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.approvedCount }
+        let toDelete = items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.approvedCount }
         let toSkip = emails.count - toArchive - toDelete
 
         let summary = ActionPlanSummary(

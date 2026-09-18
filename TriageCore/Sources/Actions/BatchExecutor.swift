@@ -50,7 +50,7 @@ public actor BatchExecutor {
                 do {
                     self.isCancelled = false
                     let approvedItems = plan.items.filter(\.isApproved)
-                    let totalActions = approvedItems.reduce(0) { $0 + $1.emailCount }
+                    let totalActions = approvedItems.reduce(0) { $0 + $1.approvedCount }
 
                     guard totalActions > 0 else {
                         continuation.yield(ExecutionProgress(
@@ -78,7 +78,11 @@ public actor BatchExecutor {
                             return
                         }
 
-                        let messageIds = item.entries.map(\.messageId)
+                        // approvedEntries, never entries: the user can exclude individual senders
+                        // from an approved item, and reading the full list here would delete exactly
+                        // the mail they had just taken out.
+                        let messageIds = item.approvedEntries.map(\.messageId)
+                        guard !messageIds.isEmpty else { continue }
                         let batchSize = provider == .gmail ? 100 : 50
                         let batches = stride(from: 0, to: messageIds.count, by: batchSize).map {
                             Array(messageIds[$0..<min($0 + batchSize, messageIds.count)])
