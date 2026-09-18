@@ -34,7 +34,9 @@ struct ActionPlanView: View {
                             onToggleApproval: { items[index].isApproved.toggle() },
                             onToggleExpand: {
                                 expandedItem = expandedItem == item.id ? nil : item.id
-                            }
+                            },
+                            excludedSenders: excludedSenders(for: item),
+                            onToggleSender: { sender in toggleSender(sender, in: index) }
                         )
                     }
                 }
@@ -129,16 +131,45 @@ struct ActionPlanView: View {
         )
     }
 
+    /// Sender addresses excluded from a given item, lowercased.
+    ///
+    /// Derived from the item's excluded message ids rather than stored separately, so the two can
+    /// never disagree — the ids are what the executor reads, and a parallel set of sender names would
+    /// be one more thing to keep in sync.
+    private func excludedSenders(for item: ActionPlanItem) -> Set<String> {
+        guard !item.excludedMessageIds.isEmpty else { return [] }
+        var excluded: Set<String> = []
+        for entry in item.entries where item.excludedMessageIds.contains(entry.messageId) {
+            excluded.insert(entry.senderEmail.lowercased())
+        }
+        return excluded
+    }
+
+    /// Include or exclude every message from one sender within one item.
+    private func toggleSender(_ senderEmail: String, in index: Int) {
+        let sender = senderEmail.lowercased()
+        let ids = items[index].entries
+            .filter { $0.senderEmail.lowercased() == sender }
+            .map(\.messageId)
+        guard !ids.isEmpty else { return }
+
+        if items[index].excludedMessageIds.isSuperset(of: ids) {
+            items[index].excludedMessageIds.subtract(ids)
+        } else {
+            items[index].excludedMessageIds.formUnion(ids)
+        }
+    }
+
     private var totalApproved: Int {
-        items.filter(\.isApproved).reduce(0) { $0 + $1.emailCount }
+        items.filter(\.isApproved).reduce(0) { $0 + $1.approvedCount }
     }
 
     private var approvedArchiveCount: Int {
-        items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.emailCount }
+        items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.approvedCount }
     }
 
     private var approvedDeleteCount: Int {
-        items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.emailCount }
+        items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.approvedCount }
     }
 
     // MARK: - Execution
@@ -161,6 +192,10 @@ struct ActionPlanItemRow: View {
     let isExpanded: Bool
     let onToggleApproval: () -> Void
     let onToggleExpand: () -> Void
+    /// Sender addresses currently excluded from this item, lowercased.
+    let excludedSenders: Set<String>
+    /// Toggle one sender in or out of this run.
+    let onToggleSender: (String) -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -180,9 +215,17 @@ struct ActionPlanItemRow: View {
                 VStack(alignment: .leading, spacing: 2) {
                     Text(item.reason)
                         .font(.body)
-                    Text("\(item.emailCount) emails from \(item.senderBreakdown.count) senders")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    // States the count that will actually be acted on. Showing only the item total
+                    // while some senders are excluded would misreport what pressing execute does.
+                    if item.approvedCount != item.emailCount {
+                        Text("\(item.approvedCount) of \(item.emailCount) emails · \(item.senderBreakdown.count) senders, some excluded")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                    } else {
+                        Text("\(item.emailCount) emails from \(item.senderBreakdown.count) senders")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 Spacer()
@@ -205,11 +248,33 @@ struct ActionPlanItemRow: View {
                     .padding(.leading, 40)
 
                 VStack(spacing: 4) {
+                    // Per-sender inclusion. The smallest thing this app could previously execute was
+                    // a whole category, so its first ever deletion would have been dozens of
+                    // messages at once on a path that had never run. One sender at a time makes a
+                    // rehearsal possible: act, check Gmail, undo, check again.
+                    Text("Untick a sender to leave it out of this run.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .padding(.horizontal, 40)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
                     ForEach(item.senderBreakdown.prefix(20), id: \.email) { sender in
                         HStack {
+                            Toggle("", isOn: Binding(
+                                get: { !excludedSenders.contains(sender.email.lowercased()) },
+                                set: { _ in onToggleSender(sender.email) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .labelsHidden()
+                            .disabled(!item.isApproved)
+
                             Text(sender.sender)
                                 .font(.caption)
                                 .lineLimit(1)
+                                .foregroundStyle(
+                                    excludedSenders.contains(sender.email.lowercased())
+                                        ? .secondary : .primary
+                                )
                             Spacer()
                             Text("\(sender.count)")
                                 .font(.caption)
@@ -219,7 +284,9 @@ struct ActionPlanItemRow: View {
                     }
 
                     if item.senderBreakdown.count > 20 {
-                        Text("and \(item.senderBreakdown.count - 20) more senders...")
+                        // Says plainly that the unticked senders below are still included, rather
+                        // than letting a truncated list imply the whole set is visible.
+                        Text("and \(item.senderBreakdown.count - 20) more senders, all included")
                             .font(.caption)
                             .foregroundStyle(.secondary)
                             .padding(.horizontal, 40)
@@ -304,11 +371,11 @@ struct ConfirmExecutionView: View {
     }
 
     private var archiveCount: Int {
-        plan.items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.emailCount }
+        plan.items.filter { $0.isApproved && $0.action == .archived }.reduce(0) { $0 + $1.approvedCount }
     }
 
     private var deleteCount: Int {
-        plan.items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.emailCount }
+        plan.items.filter { $0.isApproved && $0.action == .deleted }.reduce(0) { $0 + $1.approvedCount }
     }
 }
 
