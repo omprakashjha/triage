@@ -281,7 +281,14 @@ public extension LLMTransport {
 /// classifier whose output shape can drift is a classifier that will eventually
 /// mis-assign a tier.
 public enum SenderClassificationPrompt {
-    public static let version = "sender.v3"
+    /// Bumped whenever the prompt changes, because verdicts are cached against it.
+    ///
+    /// v4 asks every sender for keep carve-outs rather than only the visibly mixed ones, and names
+    /// the kinds of message that hide inside marketing mail. Measured motivation: of eight messages
+    /// the user had to rescue by hand from senders the model itself called promotional, its own
+    /// keepSubjects covered exactly one — it found strike notices and timetables for a rail operator
+    /// and missed a price change to the product the user pays for.
+    public static let version = "sender.v4"
 
     public static let system = """
         You classify EMAIL SENDERS for an inbox cleanup tool. For each sender you are \
@@ -317,12 +324,28 @@ public enum SenderClassificationPrompt {
         cheap. A confident wrong answer can destroy mail, which is not. Never invent \
         facts about a sender to avoid abstaining.
 
-        MANY SENDERS ARE MIXED, and one label cannot describe them. A rail operator sends \
-        both fare promotions and travel receipts from the same address; a retailer sends \
-        both offers and order confirmations. When the samples show a sender doing both, \
-        or when the provider filed their mail under more than one heading:
+        EVERY SENDER NEEDS ITS CARVE-OUTS, not only the obviously mixed ones. A rail \
+        operator sends both fare promotions and travel receipts; a retailer sends both offers \
+        and order confirmations. But a sender whose mail is overwhelmingly marketing is the \
+        MOST dangerous case, not the safest: its promotional character is what makes the few \
+        important messages inside it easy to sweep away. So for every sender:
         - put short subject fragments identifying the DISPOSABLE mail in disposableSubjects
         - put short subject fragments identifying the mail that MUST BE KEPT in keepSubjects
+
+        WHAT HIDES INSIDE MARKETING MAIL. These arrive from the same address, in the same \
+        template, as the offers — and losing one costs the user money, a deadline or an \
+        obligation. Look for them specifically, in the sender's own language:
+        - a PRICE or TARIFF change to something the user pays for
+        - a CONTRACT, SUBSCRIPTION or TERMS change, renewal or cancellation
+        - an ACTION the user must take, or a deadline: confirm, verify, complete your \
+        details, respond by
+        - SECURITY or access: a login, a device, a password, a recovery code
+        - an APPOINTMENT, booking or delivery the user is expected to attend or receive
+        - a DISRUPTION to a service the user relies on
+        - a statement, invoice, receipt or policy document
+
+        A marketing subject line saying an offer expires is NOT one of these. The test is \
+        whether the user loses something real by never seeing the message.
 
         A FRAGMENT MUST GENERALISE. It is a rule for mail you have not seen, not a label \
         for the samples in front of you. Use ONE TO THREE WORDS that recur across many of \
@@ -330,8 +353,8 @@ public enum SenderClassificationPrompt {
         line: a fragment that matches only the one message it came from is useless, and \
         every message it fails to match is left unclassified.
 
-        Good, because they recur:
-          keepSubjects: ["activity statement", "trade confirmation"]
+        Good, because they recur AND span the kinds above:
+          keepSubjects: ["activity statement", "prijs", "abonnement", "voorwaarden"]
           disposableSubjects: ["korting", "aanbieding", "magazine"]
 
         Bad, because each matches exactly one message:
