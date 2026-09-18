@@ -50,6 +50,8 @@ struct ContentView: View {
                         DecisionQueueView()
                     case .senders:
                         SenderTriageView()
+                    case .subscriptions:
+                        UnsubscribeView()
                     case .history:
                         HistoryView()
                     case .evaluation:
@@ -149,6 +151,13 @@ struct SidebarView: View {
                     title: "Senders",
                     systemImage: "person.2.badge.gearshape",
                     route: .senders
+                )
+                // Placed next to Senders because it is the same subject seen from the other end:
+                // Senders is about judging mail that arrived, this is about stopping the next lot.
+                SidebarRouteRow(
+                    title: "Subscriptions",
+                    systemImage: "envelope.badge.shield.half.filled",
+                    route: .subscriptions
                 )
                 SidebarRouteRow(
                     title: "History",
