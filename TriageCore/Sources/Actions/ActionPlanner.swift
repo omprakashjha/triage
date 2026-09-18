@@ -223,33 +223,62 @@ public struct ActionPlanner: Sendable {
 
             guard !eligibleEmails.isEmpty else { continue }
 
-            let entries = eligibleEmails.map { email in
-                ActionPlanEntry(
-                    messageId: email.messageId,
-                    sender: email.sender,
-                    senderEmail: email.senderEmail,
-                    subject: email.subject,
-                    date: email.date
-                )
+            // Split by tier before building items.
+            //
+            // Approval was previously all-or-nothing across a whole category: `allSatisfy { tier
+            // == .safe }` meant ONE review-tier message withheld every safe message beside it.
+            // Measured on a real mailbox that cost 122 of 181 safe emails — 54 safe promotions were
+            // held by 16 review siblings, 61 safe newsletters by 2, 7 safe transactional by 1 — and
+            // notification was the only category with no review mail, which is why it was the only
+            // one ever acted on.
+            //
+            // Splitting changes no safety property. Review-tier mail is still not approved; it is
+            // simply no longer able to veto mail that was cleared on its own evidence.
+            let safeEmails = eligibleEmails.filter { $0.safetyTier == .safe }
+            let unclearedEmails = eligibleEmails.filter { $0.safetyTier != .safe }
+
+            func makeEntries(_ list: [EmailMetadata]) -> [ActionPlanEntry] {
+                list.map { email in
+                    ActionPlanEntry(
+                        messageId: email.messageId,
+                        sender: email.sender,
+                        senderEmail: email.senderEmail,
+                        subject: email.subject,
+                        date: email.date
+                    )
+                }
             }
 
-            // Auto-approval must follow the SAFETY TIER, not just the category.
-            // Previously `isApproved = category != .unknown` discarded the tier the
-            // engine had computed, so mail explicitly marked .review (a receipt at 0.65
-            // confidence, an ambiguous info@ sender) landed pre-approved for deletion.
-            let allSafe = eligibleEmails.allSatisfy { $0.safetyTier == .safe }
-            let autoApprove = allSafe && category != .unknown
+            // The cleared subset: auto-approved, exactly as before, but no longer contingent on its
+            // siblings.
+            if !safeEmails.isEmpty {
+                items.append(ActionPlanItem(
+                    id: "\(category.rawValue)_\(action.rawValue)",
+                    category: category,
+                    action: action,
+                    entries: makeEntries(safeEmails),
+                    isApproved: category != .unknown,
+                    ageFilter: maxAgeDays,
+                    reason: buildReason(category: category, action: action, ageDays: maxAgeDays)
+                ))
+            }
 
-            let item = ActionPlanItem(
-                id: "\(category.rawValue)_\(action.rawValue)",
-                category: category,
-                action: action,
-                entries: entries,
-                isApproved: autoApprove,
-                ageFilter: maxAgeDays,
-                reason: buildReason(category: category, action: action, ageDays: maxAgeDays)
-            )
-            items.append(item)
+            // The undecided subset: present so the user can see and approve it deliberately, never
+            // pre-approved. Kept as its own item rather than dropped, because silently omitting mail
+            // the engine could not judge would hide the work still outstanding.
+            if !unclearedEmails.isEmpty {
+                items.append(ActionPlanItem(
+                    id: "\(category.rawValue)_\(action.rawValue)_needsReview",
+                    category: category,
+                    action: action,
+                    entries: makeEntries(unclearedEmails),
+                    isApproved: false,
+                    ageFilter: maxAgeDays,
+                    reason: buildReason(category: category, action: action, ageDays: maxAgeDays)
+                        + " — not yet cleared, approve only if you agree"
+                ))
+            }
+            continue
         }
 
         // Calculate summary
