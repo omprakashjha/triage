@@ -620,6 +620,23 @@ final class CorrectionAndIntelligenceTests: XCTestCase {
         XCTAssertTrue(prompt.contains("NOT IN ENGLISH"))
         XCTAssertTrue(prompt.contains("jaarafrekening"))
         XCTAssertTrue(prompt.contains("SAY WHEN YOU DO NOT KNOW"))
-        XCTAssertTrue(prompt.contains("MANY SENDERS ARE MIXED"))
+        // Carve-outs must be asked of EVERY sender, not only the visibly mixed ones. A sender whose
+        // mail is overwhelmingly marketing is the dangerous case, because that character is what
+        // makes the few important messages inside it easy to sweep away.
+        XCTAssertTrue(prompt.contains("EVERY SENDER NEEDS ITS CARVE-OUTS"))
+        XCTAssertTrue(prompt.contains("keepSubjects"))
+        XCTAssertTrue(prompt.contains("disposableSubjects"))
+    }
+
+    func testPromptNamesWhatHidesInsideMarketingMail() {
+        // Pinned as a list of KINDS rather than one phrase. The model found strike notices and
+        // timetables for a rail operator and missed a price change to the product the user pays for,
+        // so each of these classes is here because its absence cost a real message.
+        let prompt = SenderClassificationPrompt.system.lowercased()
+        for kind in ["price", "contract", "subscription", "terms", "security", "appointment", "deadline"] {
+            XCTAssertTrue(prompt.contains(kind), "the prompt no longer names \(kind) mail")
+        }
+        // And the counter-example, so an expiring offer is not mistaken for a real obligation.
+        XCTAssertTrue(SenderClassificationPrompt.system.contains("expires is NOT one of these"))
     }
 }
